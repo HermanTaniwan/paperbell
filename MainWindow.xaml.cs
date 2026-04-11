@@ -4438,6 +4438,19 @@ public MainWindow()
             return null;
         }
 
+        /// <summary>Planner = P, Loose Leaf = L, lainnya / kosong = tidak dipakai fitur random per grup.</summary>
+        private static string NormalizeDataMapGroup(string? raw)
+        {
+            var s = (raw ?? "").Trim();
+            if (string.IsNullOrEmpty(s)) return "";
+            var u = s.ToUpperInvariant();
+            if (u == "P") return "P";
+            if (u == "L") return "L";
+            if (u.Contains("LOOSE", StringComparison.Ordinal)) return "L";
+            if (u.Contains("PLANNER", StringComparison.Ordinal)) return "P";
+            return "";
+        }
+
         // ✅ parse kolom "Page" seperti: "1", "1-2", "2-", "-5"
         private static (int from, int to) ParsePageRange(string? s)
         {
@@ -4527,6 +4540,83 @@ public MainWindow()
                     });
                 }
             }
+        }
+
+        private void RandomPages_Click(object sender, RoutedEventArgs e)
+        {
+            if (_dataMap.Count == 0)
+            {
+                MessageBox.Show(
+                    "Data Map belum ter-load. Letakkan PaperbellDataMap.xlsx di folder config atau klik \"Load Data Map (XLSX)…\".",
+                    "Random pages",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+                return;
+            }
+
+            var (planner, loose) = BuildRandomPagePicksFromDataMap();
+            if (planner.Count == 0 && loose.Count == 0)
+            {
+                MessageBox.Show(
+                    "Tidak ada baris dengan kolom Group = P atau L dan path PDF yang terisi.\n" +
+                    "Tambahkan kolom Group / Grup di Data Map (nilai P, L, Planner, atau Loose Leaf).",
+                    "Random pages",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                return;
+            }
+
+            var dlg = new RandomPagesWindow(planner, loose, sub => ResolvePrinterName(sub));
+            dlg.Owner = this;
+            if (dlg.ShowDialog() != true || dlg.GeneratedRows == null || dlg.GeneratedRows.Count == 0)
+                return;
+
+            int idx = Rows.Count;
+            foreach (var row in dlg.GeneratedRows)
+            {
+                row.Index = ++idx;
+                Rows.Add(row);
+            }
+        }
+
+        private (List<RandomPageMapPick> planner, List<RandomPageMapPick> loose) BuildRandomPagePicksFromDataMap()
+        {
+            var planner = new List<RandomPageMapPick>();
+            var loose = new List<RandomPageMapPick>();
+            var seenP = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var seenL = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var m in _dataMap.Values)
+            {
+                var path = (m.FilePath ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(path)) continue;
+
+                var kind = m.GroupKind;
+                if (kind == "P" && seenP.Add(path))
+                    planner.Add(new RandomPageMapPick
+                    {
+                        Display = BuildRandomPagePickLabel(m, path),
+                        PdfPath = path
+                    });
+                else if (kind == "L" && seenL.Add(path))
+                    loose.Add(new RandomPageMapPick
+                    {
+                        Display = BuildRandomPagePickLabel(m, path),
+                        PdfPath = path
+                    });
+            }
+
+            static string BuildRandomPagePickLabel(DataMapRow m, string path)
+            {
+                var fn = Path.GetFileName(path);
+                var nr = (m.NoRef ?? "").Trim();
+                var v = (m.Variasi ?? "").Trim();
+                if (nr.Length > 0 && v.Length > 0) return $"{nr} / {v} — {fn}";
+                if (nr.Length > 0) return $"{nr} — {fn}";
+                return fn;
+            }
+
+            return (planner, loose);
         }
 
         public bool IsPrinted { get; set; }
@@ -5561,6 +5651,7 @@ public MainWindow()
     string? colCopies = FindColOptional(t, "Copies", "Copy", "Jumlah Copy");
     string? colDuplex = FindColOptional(t, "Duplex", "DoubleSided");
     string? colPaper = FindColOptional(t, "Size", "Paper", "Kertas");
+    string? colGroup = FindColOptional(t, "Group", "Grup", "Kelompok", "P/L", "PL");
 
     foreach (DataRow r in t.Rows)
     {
@@ -5594,6 +5685,7 @@ int pageFrom = 1, pageTo = 1;
             Duplex = SafeGet(r, colDuplex ?? ""),
             Paper = SafeGet(r, colPaper ?? ""),
             SearchAlias = r["Search Alias"]?.ToString()?.Trim(),
+            Group = SafeGet(r, colGroup ?? ""),
         };
 
         // ✅ Key utama (request): model_sku + item_sku (NoRef=ModelSKU, SKUInduk=ItemSKU)
@@ -5952,6 +6044,12 @@ if (map != null)
             public string NoRef { get; set; } = "";
             public string Variasi { get; set; } = "";
             public string FilePath { get; set; } = "";
+
+            /// <summary>Isi mentah dari kolom Group / Grup di Data Map XLSX (opsional).</summary>
+            public string Group { get; set; } = "";
+
+            /// <summary>Normalisasi ke P (Planner), L (Loose Leaf), atau kosong.</summary>
+            public string GroupKind => NormalizeDataMapGroup(Group);
 
             public string? SearchAlias { get; set; }
 

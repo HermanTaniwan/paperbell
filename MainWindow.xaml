@@ -107,6 +107,8 @@
         <DockPanel Grid.Column="0" Margin="12" LastChildFill="True">
             <StackPanel Orientation="Horizontal" DockPanel.Dock="Top" Margin="0,0,0,8">
                 <Button Content="Add PDFs…" Click="PickPdfs_Click" Margin="0,0,6,0"/>
+                <Button Content="Random pages…" Click="RandomPages_Click" Margin="0,0,6,0"
+                        ToolTip="Halaman acak dari PDF di Data Map (kolom Group P/L), ukuran A5/B5, printer Epson/Brother."/>
                 <Button Content="Load Data Map (XLSX)…" x:Name="BtnLoadMap" Click="LoadMap_Click" Margin="0,0,6,0"/>
                 <Button Content="Import Orders (XLSX)…" Click="ImportOrders_Click" Margin="0,0,6,0"/>
                 <Button x:Name="BtnConnectShopee" Content="Connect Shopee" Click="Connect_Click" Margin="0,0,6,0"/>
