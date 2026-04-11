@@ -1,0 +1,663 @@
+<Window x:Class="PaperbellAppDotNet.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:PaperbellAppDotNet" Loaded="MainWindow_Loaded"
+         WindowState="Maximized" KeyDown="Window_KeyDown" 
+        Title="Paperbell" Width="1280" Height="800"
+        Icon="pack://application:,,,/Assets/animal_icon.ico">
+
+    <Window.Resources>
+        <!-- Template mengikat Background — tema default WPF sering mengabaikan Background di ComboBox -->
+        <Style x:Key="JobRowPaperComboStyle" TargetType="ComboBox">
+            <Setter Property="Background" Value="#FFFFFF"/>
+            <Setter Property="BorderBrush" Value="#C8C8C8"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="6,4"/>
+            <Setter Property="SnapsToDevicePixels" Value="True"/>
+            <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Auto"/>
+            <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Auto"/>
+            <Setter Property="ScrollViewer.CanContentScroll" Value="True"/>
+            <Setter Property="MinHeight" Value="22"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid SnapsToDevicePixels="True">
+                            <ToggleButton x:Name="DropDownToggle"
+                                          Focusable="False"
+                                          ClickMode="Press"
+                                          MinHeight="{TemplateBinding MinHeight}"
+                                          Background="{TemplateBinding Background}"
+                                          BorderBrush="{TemplateBinding BorderBrush}"
+                                          BorderThickness="{TemplateBinding BorderThickness}"
+                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                                <ToggleButton.Template>
+                                    <ControlTemplate TargetType="ToggleButton">
+                                        <Border x:Name="Chrome"
+                                                Background="{TemplateBinding Background}"
+                                                BorderBrush="{TemplateBinding BorderBrush}"
+                                                BorderThickness="{TemplateBinding BorderThickness}"
+                                                CornerRadius="2"
+                                                Padding="{Binding Padding, RelativeSource={RelativeSource AncestorType=ComboBox}}">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="22"/>
+                                                </Grid.ColumnDefinitions>
+                                                <ContentPresenter Grid.Column="0"
+                                                                  Margin="4,0,2,0"
+                                                                  VerticalAlignment="Center"
+                                                                  HorizontalAlignment="Left"
+                                                                  Content="{Binding SelectionBoxItem, RelativeSource={RelativeSource AncestorType=ComboBox}}"/>
+                                                <Path Grid.Column="1"
+                                                      Width="10" Height="5" Stretch="Fill"
+                                                      Fill="#444444"
+                                                      Margin="0,0,6,0"
+                                                      VerticalAlignment="Center" HorizontalAlignment="Center"
+                                                      Data="M 0,0 L 5,5 L 10,0 Z"/>
+                                            </Grid>
+                                        </Border>
+                                    </ControlTemplate>
+                                </ToggleButton.Template>
+                            </ToggleButton>
+                            <Popup x:Name="PART_Popup"
+                                   IsOpen="{TemplateBinding IsDropDownOpen}"
+                                   Placement="Bottom"
+                                   PlacementTarget="{Binding ElementName=DropDownToggle}"
+                                   AllowsTransparency="True"
+                                   Focusable="False"
+                                   PopupAnimation="Slide">
+                                <Border MaxHeight="{TemplateBinding MaxDropDownHeight}"
+                                        MinWidth="{Binding ActualWidth, ElementName=DropDownToggle}"
+                                        Background="White"
+                                        BorderBrush="#AAAAAA"
+                                        BorderThickness="1">
+                                    <ScrollViewer Margin="0" SnapsToDevicePixels="True">
+                                        <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/>
+                                    </ScrollViewer>
+                                </Border>
+                            </Popup>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Paper}" Value="{x:Static local:PaperPreset.B5JIS}">
+                    <!-- Kuning gandum / butter — lembut, tidak menyilaukan -->
+                    <Setter Property="Background" Value="#F0E6C4"/>
+                    <Setter Property="BorderBrush" Value="#B89A4A"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Paper}" Value="{x:Static local:PaperPreset.A5}">
+                    <Setter Property="Background" Value="#BEA8E0"/>
+                    <Setter Property="BorderBrush" Value="#6B3F9A"/>
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="6" />
+            <ColumnDefinition Width="460" />
+        </Grid.ColumnDefinitions>
+
+        
+
+        <!-- LEFT -->
+        <DockPanel Grid.Column="0" Margin="12" LastChildFill="True">
+            <StackPanel Orientation="Horizontal" DockPanel.Dock="Top" Margin="0,0,0,8">
+                <Button Content="Add PDFs…" Click="PickPdfs_Click" Margin="0,0,6,0"/>
+                <Button Content="Load Data Map (XLSX)…" x:Name="BtnLoadMap" Click="LoadMap_Click" Margin="0,0,6,0"/>
+                <Button Content="Import Orders (XLSX)…" Click="ImportOrders_Click" Margin="0,0,6,0"/>
+                <Button x:Name="BtnConnectShopee" Content="Connect Shopee" Click="Connect_Click" Margin="0,0,6,0"/>
+                <Button Content="Shopee Sync…" Click="ShopeeSync_Click" Margin="0,0,6,0"/>
+                <Button Content="Refresh Printers" Click="RefreshPrinters_Click" Margin="0,0,6,0"/>
+                <Button Content="Print all" Click="PrintSelected_Click" Margin="0,0,6,0"
+                        ToolTip="Cetak semua baris di daftar saat ini (tab All / Not Printed / Printed)."/>
+                <Button Content="Printing log…" Click="OpenPrintLog_Click" Margin="0,0,6,0"/>
+            </StackPanel>
+
+            <TabControl x:Name="MainWorkspaceTabs" DockPanel.Dock="Bottom" Margin="0,0,0,0"
+                        SelectionChanged="MainWorkspaceTabs_SelectionChanged">
+                <TabItem Header="Cetak produk">
+            <DockPanel LastChildFill="True">
+                <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,8">
+                    <TextBlock Text="Search:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                    <Grid Width="420" Margin="0,0,12,0">
+                        <TextBox x:Name="SearchBox"
+                                 Height="28"
+                                 VerticalContentAlignment="Center"
+                                 TextChanged="SearchBox_TextChanged"
+                                 PreviewKeyDown="SearchBox_PreviewKeyDown"/>
+                        <Popup x:Name="SuggestPopup"
+                               PlacementTarget="{Binding ElementName=SearchBox}"
+                               Placement="Bottom"
+                               StaysOpen="False"
+                               AllowsTransparency="True"
+                               Focusable="False">
+                            <Border BorderThickness="1" BorderBrush="#CCC" Background="White">
+                                <ListBox x:Name="SuggestList"
+                                         Width="{Binding ElementName=SearchBox, Path=ActualWidth}"
+                                         MaxHeight="240"
+                                         ItemsSource="{Binding SearchSuggestions}"
+                                         DisplayMemberPath="Display"
+                                         PreviewMouseLeftButtonUp="SuggestList_PreviewMouseLeftButtonUp"/>
+                            </Border>
+                        </Popup>
+                    </Grid>
+                </StackPanel>
+                <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,8">
+                    <TextBlock Text="Order Shopee:" VerticalAlignment="Center" Margin="0,0,8,0" Foreground="#555"/>
+                    <Button x:Name="BtnShopeePrev" Content="Prev" Width="70" Margin="0,0,6,0" Click="BtnShopeePrev_Click"/>
+                    <TextBlock x:Name="TxtShopeePage" VerticalAlignment="Center" Text="Page 1 / 1" Margin="0,0,6,0"/>
+                    <Button x:Name="BtnShopeeNext" Content="Next" Width="70" Click="BtnShopeeNext_Click"/>
+                </StackPanel>
+                <TabControl x:Name="FilterTabs"
+                DockPanel.Dock="Top"
+                SelectedIndex="1"  
+                    SelectionChanged="FilterTabs_SelectionChanged">
+                    <TabItem Header="All" />
+                    <TabItem Header="Not Printed" />
+                    <TabItem Header="Printed" />
+                </TabControl>
+
+
+                <DataGrid x:Name="QueueGrid"
+          AutoGenerateColumns="False"
+          HeadersVisibility="Column"
+          SelectionMode="Single"
+CanUserAddRows="False"
+          EnableRowVirtualization="False"
+          EnableColumnVirtualization="False"
+          VirtualizingPanel.IsVirtualizing="False"
+          ScrollViewer.CanContentScroll="False"
+          ScrollViewer.VerticalScrollBarVisibility="Auto"
+          ScrollViewer.HorizontalScrollBarVisibility="Auto"
+          PreviewMouseLeftButtonDown="QueueGrid_PreviewMouseLeftButtonDown"
+          PreviewMouseWheel="QueueGrid_PreviewMouseWheel"
+          ScrollViewer.ScrollChanged="QueueGrid_ScrollChanged"
+          SelectionChanged="QueueGrid_SelectionChanged"
+                      ItemsSource="{Binding NotPrintedView}"
+                      >
+
+                <DataGrid.CellStyle>
+                    <Style TargetType="DataGridCell">
+                        <Setter Property="VerticalContentAlignment" Value="Top"/>
+                        <Setter Property="HorizontalContentAlignment" Value="Left"/>
+                        <Setter Property="Padding" Value="8,8"/>
+
+                        <!-- ✅ paksa template memakai Padding -->
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="DataGridCell">
+                                    <Border
+                        Background="{TemplateBinding Background}"
+                        BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="{TemplateBinding BorderThickness}"
+                        Padding="{TemplateBinding Padding}">
+                                        <ContentPresenter
+                            VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                            HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                            SnapsToDevicePixels="True"/>
+                                    </Border>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </DataGrid.CellStyle>
+
+
+                <!-- 🔴 ROW STYLE -->
+                <DataGrid.RowStyle>
+                    <Style TargetType="DataGridRow">
+                        <Setter Property="Background" Value="White"/>
+                        <Setter Property="VerticalContentAlignment" Value="Center"/>
+
+                        <Style.Triggers>
+
+                            <!-- UNMAPPED = merah -->
+                            <DataTrigger Binding="{Binding Status}" Value="UNMAPPED">
+                                <Setter Property="Background" Value="#FFE5E5"/>
+                                <Setter Property="Foreground" Value="#990000"/>
+                            </DataTrigger>
+
+                            <!-- Hover tetap enak -->
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#F3F6FF"/>
+                            </Trigger>
+
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter Property="Background" Value="#CCE5FF"/>
+                            </Trigger>
+
+                        </Style.Triggers>
+                    </Style>
+                </DataGrid.RowStyle>
+
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="44" IsReadOnly="True"/>
+
+                    
+                    <!-- Info Order (Order + Produk + Variasi + Dibuat) -->
+                    <DataGridTemplateColumn Header="Info Order" Width="250">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <StackPanel Margin="4,4,4,4">
+
+                                    <TextBlock FontWeight="SemiBold" TextWrapping="Wrap">
+                                        <Run Text="Order: "/>
+                                        <Run Text="{Binding OrderNo}" />
+                                    </TextBlock>
+
+                                    <TextBlock TextWrapping="NoWrap"
+                                               TextTrimming="CharacterEllipsis"
+                                               MaxWidth="300"
+                                               Margin="0,0,0,0">
+                                        <Run Text="Produk: "/>
+                                        <Run Text="{Binding ProductName, Mode=OneWay}" />
+                                    </TextBlock>
+
+                                    <TextBlock TextWrapping="Wrap" Margin="0,0,0,0">
+                                        <Run Text="Variasi: "/>
+                                        <Run Text="{Binding VariationName, Mode=OneWay}" />
+                                    </TextBlock>
+
+                                    <TextBlock TextWrapping="Wrap" Margin="0,0,0,0">
+                                        <Run Text="Dibuat: "/>
+                                        <Run Text="{Binding OrderCreatedText, Mode=OneWay}" />
+                                    </TextBlock>
+
+                                </StackPanel>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+
+
+                    <!-- Setting Printer + File -->
+                    <DataGridTemplateColumn Header="Setting Printer" Width="*">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <StackPanel Margin="4,4,4,4">
+
+                                    <!-- FILE (FULL PATH) -->
+                                    <TextBlock Text="{Binding File}"
+                                               FontWeight="SemiBold"
+                                               TextWrapping="Wrap"
+                                               Margin="0,0,0,6"/>
+
+                                    <!-- PRINTER -->
+                                    <StackPanel Margin="0,0,0,6">
+                                        <TextBlock Text="Printer" Foreground="Gray"/>
+                                        <ComboBox
+                                            ItemsSource="{Binding DataContext.Printers, RelativeSource={RelativeSource AncestorType=Window}}"
+    SelectedItem="{Binding Printer, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                                    </StackPanel>
+
+                                    <!-- PAPER | DUPLEX -->
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="12" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+
+                                        <StackPanel Grid.Column="0">
+                                            <TextBlock Text="Paper" Foreground="Gray"/>
+                                            <ComboBox Style="{StaticResource JobRowPaperComboStyle}"
+                                                      ItemsSource="{Binding PaperOptions, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                      SelectedItem="{Binding Paper, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                                        </StackPanel>
+
+                                        <StackPanel Grid.Column="2">
+                                            <TextBlock Text="Duplex" Foreground="Gray"/>
+                                            <ComboBox
+                                                ItemsSource="{Binding DuplexOptions, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                SelectedItem="{Binding Duplex, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                                        </StackPanel>
+                                    </Grid>
+
+                                    <!-- PAGES | COPIES -->
+                                    <Grid Margin="0,0,0,0">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="12" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+
+                                            <StackPanel Grid.Column="0">
+                                                <TextBlock Text="Pages" Foreground="Gray"/>
+                                                <TextBox Text="{Binding Pages, Mode=TwoWay, UpdateSourceTrigger=LostFocus}"/>
+                                            </StackPanel>
+
+                                            <StackPanel Grid.Column="2">
+                                            <TextBlock Text="Copies" Foreground="Gray"/>
+                                            <TextBox Text="{Binding Copies, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                                        </StackPanel>
+                                        
+                                    </Grid>
+                                    
+                                        <Border Height="4"/>
+                                </StackPanel>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+
+
+
+
+                        <DataGridTextColumn Header="Status"
+                    Binding="{Binding Status}"
+                    Width="90"
+                    IsReadOnly="True">
+                        <DataGridTextColumn.ElementStyle>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="TextWrapping" Value="Wrap"/>
+                                <Setter Property="VerticalAlignment" Value="Top"/>
+                                <Setter Property="Padding" Value="4,4"/>
+                            </Style>
+                        </DataGridTextColumn.ElementStyle>
+                    </DataGridTextColumn>
+
+
+                    <DataGridTemplateColumn Header="Printed" Width="95">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <Button Click="PrintedToggle_Click" VerticalAlignment="Top" HorizontalAlignment="Center"
+                    Padding="4,1"
+                    FontSize="11"
+                    MinHeight="0"
+                    MinWidth="0"
+                    Height="22"
+                    Width="85"
+                    Foreground="White"
+                    BorderThickness="0"
+                    IsEnabled="{Binding CanTogglePrinted}">
+                                    <Button.Style>
+                                        <Style TargetType="Button">
+                                            <Setter Property="Content" Value="NOT PRINTED"/>
+                                            <Setter Property="Background" Value="#888888"/>
+
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsPrinted}" Value="True">
+                                                    <Setter Property="Content" Value="PRINTED"/>
+                                                    <Setter Property="Background" Value="SeaGreen"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Button.Style>
+                                </Button>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+
+
+                    <DataGridTemplateColumn Header="Actions" Width="220">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <WrapPanel Margin="4,4,4,4" VerticalAlignment="Top">
+                                    <Button Content="Print" Margin="4,0" Click="PrintRow_Click"/>
+                                    <Button Content="Cancel" Margin="4,0" IsEnabled="{Binding HasJob}" Click="CancelRow_Click"/>
+                                    <Button Content="Remove" Margin="4,0" Click="RemoveRow_Click"/>
+                                </WrapPanel>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                </DataGrid.Columns>
+            </DataGrid>
+            </DockPanel>
+                </TabItem>
+                <TabItem Header="Label pengiriman">
+                    <DockPanel LastChildFill="True" Margin="0,4,0,0">
+                        <StackPanel DockPanel.Dock="Top" Margin="0,0,0,6">
+                            <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="Printer label:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <ComboBox x:Name="CmbResiPrinter" Width="300" VerticalAlignment="Center"
+                                      ItemsSource="{Binding Printers}"/>
+                            <Button Content="Refresh daftar" Click="BtnResiRefresh_Click" Margin="12,0,6,0" Padding="10,4"/>
+                            <Button Content="Pilih semua (halaman)" Click="BtnResiSelectAllPage_Click" Margin="0,0,6,0" Padding="10,4"
+                                    ToolTip="Sorot semua baris di halaman ini (sama seperti select all di Excel)."/>
+                            <Button Content="Hapus pilihan" Click="BtnResiClearChecks_Click" Margin="0,0,6,0" Padding="10,4"
+                                    ToolTip="Bersihkan semua baris yang disorot."/>
+                            <Button Content="Ambil label (PDF)" Click="BtnResiFetchPdf_Click" Margin="0,0,6,0" Padding="10,4"
+                                    ToolTip="Unduh PDF untuk semua baris yang disorot (biru). Ctrl+klik / Shift+klik seperti Excel."/>
+                            <Button Content="Cetak label" Click="BtnResiPrint_Click" Margin="0,0,0,0" Padding="10,4"
+                                    ToolTip="Cetak PDF untuk baris yang disorot (sudah ada file), berurutan. Progress di bawah pemilih printer. A6, hitam-putih, skala 0,75×, rata kiri-atas."/>
+                            </StackPanel>
+                            <StackPanel x:Name="ResiPrintProgressPanel" Margin="0,8,0,0" Visibility="Collapsed">
+                                <ProgressBar x:Name="PbResiPrintProgress" Height="10" Minimum="0" Maximum="100" Value="0"/>
+                                <TextBlock x:Name="TxtResiPrintStatus" Margin="0,4,0,0" FontSize="11" Foreground="#555"
+                                           TextTrimming="CharacterEllipsis"/>
+                            </StackPanel>
+                        </StackPanel>
+                        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,8">
+                            <Button x:Name="BtnResiPrev" Content="Prev" Width="64" Margin="0,0,6,0" VerticalAlignment="Center" Click="BtnResiPrev_Click"/>
+                            <TextBlock x:Name="TxtResiPage" VerticalAlignment="Center" Margin="0,0,6,0" Text="Page 1 / 1"/>
+                            <Button x:Name="BtnResiNext" Content="Next" Width="64" VerticalAlignment="Center" Click="BtnResiNext_Click"/>
+                        </StackPanel>
+                        <TabControl x:Name="ResiFilterTabs" SelectedIndex="1" Margin="0"
+                                    SelectionChanged="ResiFilterTabs_SelectionChanged"
+                                    VerticalAlignment="Stretch">
+                            <TabItem Header="Semua">
+                                <Grid x:Name="ResiGridHost0" Margin="0"/>
+                            </TabItem>
+                            <TabItem Header="Belum cetak label">
+                                <Grid x:Name="ResiGridHost1" Margin="0">
+                        <DataGrid x:Name="ResiGrid"
+                                  AutoGenerateColumns="False"
+                                  HeadersVisibility="Column"
+                                  SelectionUnit="FullRow"
+                                  SelectionMode="Extended"
+                                  CanUserAddRows="False"
+                                  FocusVisualStyle="{x:Null}"
+                                  GridLinesVisibility="All"
+                                  KeyboardNavigation.TabNavigation="Once"
+                                  SelectionChanged="ResiGrid_SelectionChanged"
+                                  ItemsSource="{Binding ResiRows}"
+                                  VerticalAlignment="Stretch" HorizontalAlignment="Stretch">
+                            <DataGrid.RowStyle>
+                                <Style TargetType="DataGridRow">
+                                    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+                                    <Setter Property="BorderThickness" Value="0"/>
+                                    <Setter Property="Margin" Value="0"/>
+                                </Style>
+                            </DataGrid.RowStyle>
+                            <DataGrid.CellStyle>
+                                <Style TargetType="DataGridCell">
+                                    <Setter Property="Padding" Value="8,8"/>
+                                    <Setter Property="VerticalContentAlignment" Value="Center"/>
+                                    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+                                    <Setter Property="BorderThickness" Value="0"/>
+                                    <Setter Property="BorderBrush" Value="Transparent"/>
+                                    <Setter Property="Template">
+                                        <Setter.Value>
+                                            <ControlTemplate TargetType="DataGridCell">
+                                                <Border Background="{TemplateBinding Background}"
+                                                        BorderBrush="{TemplateBinding BorderBrush}"
+                                                        BorderThickness="{TemplateBinding BorderThickness}"
+                                                        Padding="{TemplateBinding Padding}">
+                                                    <ContentPresenter VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                                                      SnapsToDevicePixels="True"/>
+                                                </Border>
+                                            </ControlTemplate>
+                                        </Setter.Value>
+                                    </Setter>
+                                    <Style.Triggers>
+                                        <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                                            <Setter Property="BorderThickness" Value="0"/>
+                                            <Setter Property="BorderBrush" Value="Transparent"/>
+                                        </Trigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </DataGrid.CellStyle>
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="Order SN" Binding="{Binding OrderSn}" Width="160" IsReadOnly="True">
+                                    <DataGridTextColumn.ElementStyle>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Padding" Value="2,2"/>
+                                        </Style>
+                                    </DataGridTextColumn.ElementStyle>
+                                </DataGridTextColumn>
+                                <DataGridTextColumn Header="Dibuat" Binding="{Binding OrderCreatedText}" Width="130" IsReadOnly="True">
+                                    <DataGridTextColumn.ElementStyle>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Padding" Value="2,2"/>
+                                        </Style>
+                                    </DataGridTextColumn.ElementStyle>
+                                </DataGridTextColumn>
+                                <DataGridTemplateColumn Header="PDF" Width="100" IsReadOnly="True">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <Border CornerRadius="10" Padding="10,4" HorizontalAlignment="Left"
+                                                    VerticalAlignment="Center">
+                                                <Border.Style>
+                                                    <Style TargetType="Border">
+                                                        <Setter Property="Background" Value="#E0E0E0"/>
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding HasPdfFile}" Value="True">
+                                                                <Setter Property="Background" Value="#2E7D32"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </Border.Style>
+                                                <TextBlock FontSize="11" FontWeight="SemiBold">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock">
+                                                            <Setter Property="Text" Value="Belum"/>
+                                                            <Setter Property="Foreground" Value="#555"/>
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding HasPdfFile}" Value="True">
+                                                                    <Setter Property="Text" Value="Ada PDF"/>
+                                                                    <Setter Property="Foreground" Value="White"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
+                                            </Border>
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                                <DataGridTextColumn Header="Status cetak" Binding="{Binding ResiPrintedLabel}" Width="110" IsReadOnly="True">
+                                    <DataGridTextColumn.ElementStyle>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Padding" Value="2,2"/>
+                                        </Style>
+                                    </DataGridTextColumn.ElementStyle>
+                                </DataGridTextColumn>
+                                <DataGridTemplateColumn Header="Aksi" Width="*">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <StackPanel Orientation="Horizontal" Margin="2">
+                                                <Button Content="Ambil PDF" Margin="0,0,4,0" Padding="6,2" Click="ResiRowFetch_Click"
+                                                        Focusable="False"/>
+                                                <Button Content="Cetak" Margin="0,0,4,0" Padding="6,2" Click="ResiRowPrint_Click"
+                                                        Focusable="False"/>
+                                                <Button Content="Tandai" Padding="6,2" Click="ResiRowTogglePrinted_Click"
+                                                        Focusable="False"
+                                                        ToolTip="Tandai sudah/belum cetak label (tanpa cetak)"/>
+                                            </StackPanel>
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                            </DataGrid.Columns>
+                        </DataGrid>
+                                </Grid>
+                            </TabItem>
+                            <TabItem Header="Sudah cetak label">
+                                <Grid x:Name="ResiGridHost2" Margin="0"/>
+                            </TabItem>
+                        </TabControl>
+                    </DockPanel>
+                </TabItem>
+            </TabControl>
+        </DockPanel>
+
+        <!-- Divider -->
+        <Border Grid.Column="1" Background="#ddd"/>
+
+        <!-- RIGHT -->
+        <DockPanel Grid.Column="2" Margin="12">
+            <TextBlock x:Name="TxtPdfPreviewTitle" Text="PDF Preview" FontWeight="Bold" DockPanel.Dock="Top" Margin="0,0,0,4"/>
+            <TextBlock x:Name="TxtPreviewHint" DockPanel.Dock="Top" TextWrapping="Wrap" Margin="0,0,0,8"
+                       Foreground="#666" FontSize="12" Visibility="Collapsed"/>
+
+            <!-- Bungkus preview pakai Grid supaya bisa overlay -->
+            <Grid>
+                <!-- Existing preview -->
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <ItemsControl x:Name="Thumbs">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <WrapPanel Orientation="Horizontal"/>
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Border BorderBrush="#ccc" BorderThickness="1" Margin="6" Padding="6" Background="White">
+                                    <StackPanel>
+                                        <Image Source="{Binding Image}" Width="180" Stretch="Uniform"
+                                       Cursor="Hand" MouseLeftButtonUp="Thumb_Click"/>
+                                        <TextBlock Text="{Binding Caption}" Margin="0,6,0,0" HorizontalAlignment="Center"/>
+                                    </StackPanel>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+
+                <!-- ✅ Overlay loading text -->
+                <Border x:Name="PreviewLoadingOverlay"
+                Background="#AAFFFFFF"
+                Visibility="Collapsed">
+                    <TextBlock x:Name="PreviewLoadingText"
+                       Text="Loading..."
+                       TextWrapping="Wrap"
+                       Margin="12"
+                       FontSize="14"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center"/>
+                </Border>
+            </Grid>
+        </DockPanel>
+
+        <!-- Unduh label massal: progress -->
+        <Grid x:Name="ResiBulkFetchOverlay" Grid.ColumnSpan="3" Panel.ZIndex="300" Visibility="Collapsed"
+              Background="#AA1a1a1a">
+            <Border Background="White" CornerRadius="10" Padding="22" Width="520" MaxWidth="520" HorizontalAlignment="Center"
+                    VerticalAlignment="Center">
+                <StackPanel>
+                    <TextBlock x:Name="TxtResiBulkTitle" FontSize="16" FontWeight="SemiBold" Text="Mengunduh label PDF"
+                               Margin="0,0,0,14"/>
+                    <ProgressBar x:Name="PbResiBulk" Height="24" MinHeight="24" MaxHeight="24"
+                                 Minimum="0" Maximum="100" Value="0" VerticalAlignment="Top"/>
+                    <TextBlock x:Name="TxtResiBulkProgressLine" Margin="0,10,0,4" FontSize="11" FontWeight="SemiBold"
+                               Foreground="#333" Height="22" VerticalAlignment="Top"
+                               TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"
+                               Text="0 / 0 selesai"/>
+                    <TextBlock x:Name="TxtResiBulkDetail" Margin="0,0,0,0" Foreground="#666" FontSize="10"
+                               Height="22" VerticalAlignment="Top"
+                               TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"
+                               Text="Menyiapkan…"/>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <!-- Modal -->
+        <Grid x:Name="Modal" Visibility="Collapsed" Background="#88000000">
+            <Border Background="White" CornerRadius="8" Padding="12"
+              HorizontalAlignment="Center" VerticalAlignment="Center">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button Content="−" Width="30" Click="ZoomOut_Click" Margin="0,0,6,0"/>
+                        <TextBlock x:Name="ZoomText" VerticalAlignment="Center" Text="100%" Margin="0,0,6,0"/>
+                        <Button Content="+" Width="30" Click="ZoomIn_Click" Margin="0,0,6,0"/>
+                        <Button Content="Close" Click="CloseModal_Click"/>
+                    </StackPanel>
+                    <ScrollViewer Height="640" Width="900">
+                        <Image x:Name="FullImage" Stretch="Uniform"/>
+                    </ScrollViewer>
+                </StackPanel>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>
