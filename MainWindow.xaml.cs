@@ -50,15 +50,282 @@ namespace PaperbellAppDotNet
         public string? Log { get; set; }
     }
 
+    /// <summary>One row in <c>product_inventory</c> for the inventory management window.</summary>
+    public sealed class InventoryListItem
+    {
+        public string ItemKey { get; set; } = "";
+        public string ModelSku { get; set; } = "";
+        public string ItemSku { get; set; } = "";
+        public string ItemName { get; set; } = "";
+        public string ModelName { get; set; } = "";
+        public string NoRef { get; set; } = "";
+        public string SkuInduk { get; set; } = "";
+        public int Qty { get; set; }
+        public long UpdatedAtUnix { get; set; }
+    }
+
+    public enum OrderFulfillmentStatus
+    {
+        PendingPrint,
+        WaitingResi,
+        ReadyToPack,
+        Cancelled
+    }
+
+    public sealed class OrderFulfillmentInfo
+    {
+        public int TotalLines { get; init; }
+        public int NotPrintedLines { get; init; }
+        public int PrintedLines => Math.Max(0, TotalLines - NotPrintedLines);
+        public bool ResiPrinted { get; init; }
+        public OrderFulfillmentStatus Status { get; init; }
+
+        public string GetPackMissingDescription()
+        {
+            return Status switch
+            {
+                OrderFulfillmentStatus.ReadyToPack => "Siap dibungkus (semua produk + label selesai)",
+                OrderFulfillmentStatus.WaitingResi => "Label pengiriman belum dicetak",
+                OrderFulfillmentStatus.PendingPrint when TotalLines > 0 =>
+                    $"{NotPrintedLines} dari {TotalLines} produk belum dicetak",
+                OrderFulfillmentStatus.PendingPrint => "Produk belum dicetak",
+                _ => ""
+            };
+        }
+
+        public static OrderFulfillmentInfo FromAggregate(int notPrinted, int total, bool resiPrinted, bool isCancelled)
+        {
+            if (isCancelled)
+                return new OrderFulfillmentInfo
+                {
+                    TotalLines = total,
+                    NotPrintedLines = notPrinted,
+                    ResiPrinted = resiPrinted,
+                    Status = OrderFulfillmentStatus.Cancelled
+                };
+
+            OrderFulfillmentStatus status;
+            if (notPrinted > 0)
+                status = OrderFulfillmentStatus.PendingPrint;
+            else if (!resiPrinted)
+                status = OrderFulfillmentStatus.WaitingResi;
+            else
+                status = OrderFulfillmentStatus.ReadyToPack;
+
+            return new OrderFulfillmentInfo
+            {
+                TotalLines = total,
+                NotPrintedLines = notPrinted,
+                ResiPrinted = resiPrinted,
+                Status = status
+            };
+        }
+    }
+
+    public sealed class PackOrderRow : INotifyPropertyChanged
+    {
+        public int Index { get => _index; set { _index = value; On(); } }
+        private int _index;
+
+        public string OrderSn { get => _orderSn; set { _orderSn = value; On(); } }
+        private string _orderSn = "";
+
+        public string OrderCreatedText { get => _orderCreatedText; set { _orderCreatedText = value; On(); } }
+        private string _orderCreatedText = "";
+
+        public int LineCount { get => _lineCount; set { _lineCount = value; On(); On(nameof(LineCountText)); } }
+        private int _lineCount;
+
+        public string LineCountText => LineCount <= 0 ? "—" : $"{LineCount} item";
+
+        public OrderFulfillmentStatus FulfillmentStatus
+        {
+            get => _fulfillmentStatus;
+            set
+            {
+                if (_fulfillmentStatus == value) return;
+                _fulfillmentStatus = value;
+                On();
+                On(nameof(IsReadyToPack));
+                On(nameof(CanMarkPackaged));
+                On(nameof(CanUndoPackaged));
+                On(nameof(PackActionButtonText));
+                On(nameof(StatusBadgeText));
+            }
+        }
+
+        private OrderFulfillmentStatus _fulfillmentStatus = OrderFulfillmentStatus.PendingPrint;
+
+        public string PackMissingDescription
+        {
+            get => _packMissingDescription;
+            set { _packMissingDescription = value; On(); }
+        }
+
+        private string _packMissingDescription = "";
+
+        public bool IsPackaged
+        {
+            get => _isPackaged;
+            set
+            {
+                if (_isPackaged == value) return;
+                _isPackaged = value;
+                On();
+                On(nameof(CanMarkPackaged));
+                On(nameof(CanUndoPackaged));
+                On(nameof(PackActionButtonText));
+                On(nameof(PackagedLabel));
+            }
+        }
+
+        private bool _isPackaged;
+
+        public bool IsReadyToPack => FulfillmentStatus == OrderFulfillmentStatus.ReadyToPack;
+
+        public bool CanMarkPackaged => IsReadyToPack && !IsPackaged;
+
+        public bool CanUndoPackaged => IsPackaged;
+
+        public string PackActionButtonText => IsPackaged ? "Batalkan tandai" : "Sudah dibungkus";
+
+        public string StatusBadgeText =>
+            IsPackaged ? "Sudah dibungkus" :
+            IsReadyToPack ? "Siap bungkus" : "Belum siap";
+
+        public string PackagedLabel => IsPackaged ? "Sudah dibungkus" : "";
+
+        public string PackagedAtText
+        {
+            get => _packagedAtText;
+            set { _packagedAtText = value; On(); }
+        }
+
+        private string _packagedAtText = "";
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+
+        private void On([CallerMemberName] string? n = null) =>
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(n));
+    }
+
     public partial class MainWindow : Window
     {
         // Options for per-row settings (used by DataGrid ComboBoxes)
         public Array DuplexOptions => Enum.GetValues(typeof(DuplexMode));
+        public Array PrintSideOptions => Enum.GetValues(typeof(PrintSideMode));
         public Array PaperOptions => Enum.GetValues(typeof(PaperPreset));
 
         public ObservableCollection<JobRow> Rows { get; } = new();
+        public ObservableCollection<PackOrderRow> PackRows { get; } = new();
         public ObservableCollection<string> Printers { get; } = new();
         public ObservableCollection<ResiRow> ResiRows { get; } = new();
+
+        private const string PrinterOverrideAuto = "(auto)";
+        private string? _overrideBrotherPrinter;
+        private string? _overrideL3210Printer;
+        private readonly Dictionary<JobRow, string> _productPrinterBeforeOverride = new();
+
+        private string BuildOverridePrinterStatusText()
+        {
+            var bro = string.IsNullOrWhiteSpace(_overrideBrotherPrinter) ? PrinterOverrideAuto : _overrideBrotherPrinter;
+            var l32 = string.IsNullOrWhiteSpace(_overrideL3210Printer) ? PrinterOverrideAuto : _overrideL3210Printer;
+            return $"Override: Brother -> {bro}, L3210 -> {l32}";
+        }
+
+        private void UpdateOverridePrinterStatusUi()
+        {
+            if (TxtOverridePrinterStatus != null)
+                TxtOverridePrinterStatus.Text = BuildOverridePrinterStatusText();
+        }
+
+        private bool IsAnyPrinterOverrideActive =>
+            !string.IsNullOrWhiteSpace(_overrideBrotherPrinter) ||
+            !string.IsNullOrWhiteSpace(_overrideL3210Printer);
+
+        private static bool IsBrotherToken(string token) =>
+            token.IndexOf("brother", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        private static bool IsL3210Token(string token) =>
+            token.IndexOf("l3210", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        /// <summary>
+        /// Terapkan override printer ke semua baris Cetak produk yang sudah ada.
+        /// Saat override aktif, dropdown printer dikunci (tidak bisa diubah manual).
+        /// </summary>
+        private void ApplyPrinterOverrideToProductRows()
+        {
+            var hasAnyOverride = IsAnyPrinterOverrideActive;
+            foreach (var r in Rows)
+            {
+                var current = (r.Printer ?? "").Trim();
+                if (current.Length == 0)
+                {
+                    r.IsPrinterEditable = true;
+                    continue;
+                }
+
+                // Ambil "base printer" (sebelum override) jika pernah tersimpan.
+                var basePrinter = _productPrinterBeforeOverride.TryGetValue(r, out var originalSaved)
+                    ? originalSaved
+                    : current;
+
+                var affectedByBrother = IsBrotherToken(basePrinter) && !string.IsNullOrWhiteSpace(_overrideBrotherPrinter);
+                var affectedByL3210 = IsL3210Token(basePrinter) && !string.IsNullOrWhiteSpace(_overrideL3210Printer);
+                var rowAffected = affectedByBrother || affectedByL3210;
+
+                if (rowAffected)
+                {
+                    // Simpan nilai printer asli (sebelum override) sekali per row.
+                    if (!_productPrinterBeforeOverride.ContainsKey(r))
+                        _productPrinterBeforeOverride[r] = current;
+
+                    r.IsPrinterEditable = false;
+                    var replaced = ResolveProductPrinterWithOverride(basePrinter);
+                    if (!string.IsNullOrWhiteSpace(replaced) &&
+                        !string.Equals(r.Printer, replaced, StringComparison.OrdinalIgnoreCase))
+                    {
+                        r.Printer = replaced;
+                    }
+                }
+                else
+                {
+                    r.IsPrinterEditable = true;
+                    // Jika row ini pernah dioverride, kembalikan ke nilai awal.
+                    if (_productPrinterBeforeOverride.TryGetValue(r, out var original) &&
+                        !string.IsNullOrWhiteSpace(original))
+                    {
+                        r.Printer = original;
+                        _productPrinterBeforeOverride.Remove(r);
+                    }
+                }
+            }
+
+            if (!hasAnyOverride)
+                _productPrinterBeforeOverride.Clear();
+        }
+
+        /// <summary>
+        /// Terapkan override printer untuk modul Cetak produk:
+        /// - Jika printer mengandung "Brother" dan override Brother diset, pakai override tsb.
+        /// - Jika printer mengandung "L3210" dan override L3210 diset, pakai override tsb.
+        /// - Selain itu pakai printer asli (lalu di-resolve ke installed printer).
+        /// </summary>
+        private string? ResolveProductPrinterWithOverride(string? token)
+        {
+            var t = (token ?? "").Trim();
+            if (t.Length == 0) return null;
+
+            if (t.IndexOf("brother", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                !string.IsNullOrWhiteSpace(_overrideBrotherPrinter))
+                return _overrideBrotherPrinter;
+
+            if (t.IndexOf("l3210", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                !string.IsNullOrWhiteSpace(_overrideL3210Printer))
+                return _overrideL3210Printer;
+
+            return ResolvePrinterName(t);
+        }
 
         private double _zoom = 1.0;
         private (string file, int page, int total)? _full;
@@ -227,8 +494,20 @@ namespace PaperbellAppDotNet
         {
             All,
             NotPrinted,
-            Printed
+            Printed,
+            ReadyToPack,
+            Packaged,
+            Cancelled
         }
+
+        /// <summary>SQL: status Shopee bukan CANCELLED — tabel <c>order_process</c> tanpa alias.</summary>
+        private const string SqlOrderNotCancelled = "(IFNULL(UPPER(TRIM(status)), '') <> 'CANCELLED')";
+
+        /// <summary>SQL: status Shopee bukan CANCELLED — <c>order_process</c> alias <c>op</c> (query dengan JOIN).</summary>
+        private const string SqlOpOrderNotCancelled = "(IFNULL(UPPER(TRIM(op.status)), '') <> 'CANCELLED')";
+
+        /// <summary>SQL: order sudah dibatalkan — hanya tab Cancel.</summary>
+        private const string SqlOrderIsCancelled = "(IFNULL(UPPER(TRIM(status)), '') = 'CANCELLED')";
 
         // filter aktif saat ini (default: NotPrinted, supaya tab default = Not Printed)
         private ShopeeTabFilter _currentTabFilter = ShopeeTabFilter.NotPrinted;
@@ -237,6 +516,9 @@ namespace PaperbellAppDotNet
         private int _pageIndexAll = 0;
         private int _pageIndexNotPrinted = 0;
         private int _pageIndexPrinted = 0;
+        private int _pageIndexReadyToPack = 0;
+        private int _pageIndexPackaged = 0;
+        private int _pageIndexCancelled = 0;
 
         // state page & total untuk tab yang lagi aktif
         private int _shopeePageIndex = 0;          // 0-based
@@ -247,18 +529,20 @@ namespace PaperbellAppDotNet
         {
             All,
             NotPrintedResi,
-            PrintedResi
+            PrintedResi,
+            CancelledResi
         }
 
         private ResiTabFilter _resiTabFilter = ResiTabFilter.NotPrintedResi;
         private int _resiPageIndexAll;
         private int _resiPageIndexNotPrinted;
         private int _resiPageIndexPrinted;
+        private int _resiPageIndexCancelled;
         private int _resiPageIndex;
         private int _resiTotalItems;
         private const int ResiPageSize = 25;
         private const int ResiListDaysBack = 30;
-        private const double ResiLabelPdfPrintScale = 0.75;
+        private const double ResiLabelPdfPrintScale = 0.7125;
         /// <summary>Substring untuk default combo printer label (mis. "EPSON L3210 Series").</summary>
         private const string ResiDefaultPrinterNameContains = "L3210";
         private readonly JobRow _resiPreviewStub = new() { OrderNo = "Resi", Status = "Ready" };
@@ -352,13 +636,58 @@ namespace PaperbellAppDotNet
             if (row.OrderProcessId <= 0) return;
 
             var newValue = !row.IsPrinted;
-
-            // Persist by PK id so it always hits the correct row.
-            DbSetPrintedById(row.OrderProcessId, newValue);
-
-            row.IsPrinted = newValue;
+            if (newValue)
+            {
+                DbSetPrintedSidesById(row.OrderProcessId, true, true);
+                row.PrintedOddSide = true;
+                row.PrintedEvenSide = true;
+                row.IsPrinted = true;
+            }
+            else
+            {
+                DbSetPrintedSidesById(row.OrderProcessId, false, false);
+                row.PrintedOddSide = false;
+                row.PrintedEvenSide = false;
+                row.IsPrinted = false;
+            }
 
             // 🔽 reload page sekarang di tab aktif
+            LoadShopeePageFromDb(_shopeePageIndex);
+        }
+
+        private void OpenInventory_Click(object sender, RoutedEventArgs e)
+        {
+            var w = new InventoryWindow(this) { Owner = this };
+            w.ShowDialog();
+            LoadInventoryCacheFromDb();
+            LoadShopeePageFromDb(_shopeePageIndex);
+        }
+
+        private void UseInventory_Click(object sender, RoutedEventArgs e)
+        {
+            if ((sender as FrameworkElement)?.DataContext is not JobRow row) return;
+            if (!row.CanUseInventory) return;
+
+            var outcome = DbConsumeInventoryForOrder(row.OrderProcessId, row.VariationCode, row.OrderItemQty);
+            switch (outcome)
+            {
+                case InventoryConsumeOutcome.NoStock:
+                    MessageBox.Show(
+                        "Tidak ada stok inventory untuk item ini.",
+                        "Inventory",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                    break;
+                case InventoryConsumeOutcome.Failed:
+                    MessageBox.Show(
+                        "Gagal memakai stok (order sudah dicetak atau data berubah).",
+                        "Inventory",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    break;
+            }
+
+            LoadInventoryCacheFromDb();
             LoadShopeePageFromDb(_shopeePageIndex);
         }
 
@@ -887,6 +1216,363 @@ private string? _accessToken;
 private string? _refreshToken;
 private DateTimeOffset _accessTokenExpiredAt = DateTimeOffset.MinValue;
 
+        /// <summary>item_key → qty on hand (product_inventory).</summary>
+        private readonly Dictionary<string, int> _inventoryQty = new(StringComparer.OrdinalIgnoreCase);
+
+        public void ReloadInventoryCacheFromDb() => LoadInventoryCacheFromDb();
+
+        private void LoadInventoryCacheFromDb()
+        {
+            _inventoryQty.Clear();
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = "SELECT item_key, qty FROM product_inventory;";
+            using var rd = cmd.ExecuteReader();
+            while (rd.Read())
+            {
+                var k = rd.IsDBNull(0) ? "" : rd.GetString(0);
+                var q = rd.IsDBNull(1) ? 0 : rd.GetInt32(1);
+                if (string.IsNullOrEmpty(k)) continue;
+                _inventoryQty[k] = q;
+            }
+        }
+
+        /// <summary>Rows for Inventory window grid (all records, including qty 0).</summary>
+        public List<InventoryListItem> DbListInventoryItems()
+        {
+            var list = new List<InventoryListItem>();
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = @"
+SELECT item_key, model_sku, item_sku, item_name, model_name, no_ref, sku_induk, qty, updated_at
+FROM product_inventory
+ORDER BY COALESCE(item_name, ''), item_key;";
+            using var rd = cmd.ExecuteReader();
+            while (rd.Read())
+            {
+                list.Add(new InventoryListItem
+                {
+                    ItemKey = rd.IsDBNull(0) ? "" : rd.GetString(0),
+                    ModelSku = rd.IsDBNull(1) ? "" : rd.GetString(1),
+                    ItemSku = rd.IsDBNull(2) ? "" : rd.GetString(2),
+                    ItemName = rd.IsDBNull(3) ? "" : rd.GetString(3),
+                    ModelName = rd.IsDBNull(4) ? "" : rd.GetString(4),
+                    NoRef = rd.IsDBNull(5) ? "" : rd.GetString(5),
+                    SkuInduk = rd.IsDBNull(6) ? "" : rd.GetString(6),
+                    Qty = rd.IsDBNull(7) ? 0 : rd.GetInt32(7),
+                    UpdatedAtUnix = rd.IsDBNull(8) ? 0 : rd.GetInt64(8)
+                });
+            }
+
+            return list;
+        }
+
+        /// <summary>Add stock from a DataMap row; key matches Shopee <c>KeyModelItem(NoRef, SKUInduk)</c>.</summary>
+        public void DbInventoryAddFromMap(DataMapRow map, int addQty)
+        {
+            if (addQty <= 0) return;
+            var itemKey = KeyModelItem(map.NoRef, map.SKUInduk);
+            if (string.IsNullOrEmpty(itemKey)) return;
+
+            var ms = (map.NoRef ?? "").Trim();
+            var isk = (map.SKUInduk ?? "").Trim();
+            var displayName = (map.SearchAlias ?? "").Trim();
+            var modelName = (map.Variasi ?? "").Trim();
+            var now = UnixNow();
+
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO product_inventory(item_key, model_sku, item_sku, item_name, model_name, no_ref, sku_induk, qty, updated_at)
+VALUES($k, $ms, $is, $in, $mn, $nr, $si, $q, $t)
+ON CONFLICT(item_key) DO UPDATE SET
+    model_sku = excluded.model_sku,
+    item_sku = excluded.item_sku,
+    item_name = excluded.item_name,
+    model_name = excluded.model_name,
+    no_ref = excluded.no_ref,
+    sku_induk = excluded.sku_induk,
+    qty = product_inventory.qty + excluded.qty,
+    updated_at = excluded.updated_at;
+";
+            cmd.Parameters.AddWithValue("$k", itemKey);
+            cmd.Parameters.AddWithValue("$ms", ms);
+            cmd.Parameters.AddWithValue("$is", isk);
+            cmd.Parameters.AddWithValue("$in", displayName);
+            cmd.Parameters.AddWithValue("$mn", modelName);
+            cmd.Parameters.AddWithValue("$nr", ms);
+            cmd.Parameters.AddWithValue("$si", isk);
+            cmd.Parameters.AddWithValue("$q", addQty);
+            cmd.Parameters.AddWithValue("$t", now);
+            cmd.ExecuteNonQuery();
+        }
+
+        /// <summary>
+        /// Tambah stok inventory untuk semua baris item pada order Shopee yang sudah di-sync (mis. retur).
+        /// Pakai <c>item_key</c> dan qty dari <c>order_process</c>.
+        /// </summary>
+        /// <returns>Jumlah baris item yang berhasil di-upsert (0 jika order tidak ada / tidak ada baris valid).</returns>
+        public int DbInventoryAddFromOrderSn(string orderSn)
+        {
+            var sn = (orderSn ?? "").Trim();
+            if (string.IsNullOrEmpty(sn)) return 0;
+
+            var lines = new List<(string ItemKey, string Ms, string Isk, string Iname, string Mname, int Qty)>();
+            using (var con = OpenDb())
+            {
+                con.Open();
+                using var cmd = con.CreateCommand();
+                cmd.CommandText = @"
+SELECT item_key, model_sku, item_sku, item_name, model_name, qty
+FROM order_process
+WHERE order_sn = $sn;";
+                cmd.Parameters.AddWithValue("$sn", sn);
+                using var rd = cmd.ExecuteReader();
+                while (rd.Read())
+                {
+                    var ik = rd.IsDBNull(0) ? "" : rd.GetString(0);
+                    if (string.IsNullOrWhiteSpace(ik)) continue;
+                    var qty = rd.IsDBNull(5) ? 0 : rd.GetInt32(5);
+                    if (qty <= 0) continue;
+
+                    var ms = rd.IsDBNull(1) ? "" : rd.GetString(1).Trim();
+                    var isk = rd.IsDBNull(2) ? "" : rd.GetString(2).Trim();
+                    var iname = rd.IsDBNull(3) ? "" : rd.GetString(3).Trim();
+                    var mname = rd.IsDBNull(4) ? "" : rd.GetString(4).Trim();
+
+                    // Kalau ada DataMap untuk baris ini, pakai SearchAlias biar nama konsisten dengan tambah manual.
+                    if (_dataMap.TryGetValue(ik.Trim(), out var map) && map != null)
+                    {
+                        if (!string.IsNullOrWhiteSpace(map.SearchAlias))
+                            iname = map.SearchAlias.Trim();
+                        if (!string.IsNullOrWhiteSpace(map.Variasi))
+                            mname = map.Variasi.Trim();
+                        if (!string.IsNullOrWhiteSpace(map.NoRef)) ms = map.NoRef.Trim();
+                        if (!string.IsNullOrWhiteSpace(map.SKUInduk)) isk = map.SKUInduk.Trim();
+                    }
+
+                    lines.Add((ik.Trim(), ms, isk, iname, mname, qty));
+                }
+            }
+
+            if (lines.Count == 0) return 0;
+
+            using var con2 = OpenDb();
+            con2.Open();
+            using var tx = con2.BeginTransaction();
+            try
+            {
+                foreach (var line in lines)
+                {
+                    var now = UnixNow();
+                    using var cmd = con2.CreateCommand();
+                    cmd.Transaction = tx;
+                    cmd.CommandText = @"
+INSERT INTO product_inventory(item_key, model_sku, item_sku, item_name, model_name, no_ref, sku_induk, qty, updated_at)
+VALUES($k, $ms, $is, $in, $mn, $nr, $si, $q, $t)
+ON CONFLICT(item_key) DO UPDATE SET
+    model_sku = excluded.model_sku,
+    item_sku = excluded.item_sku,
+    item_name = excluded.item_name,
+    model_name = excluded.model_name,
+    no_ref = excluded.no_ref,
+    sku_induk = excluded.sku_induk,
+    qty = product_inventory.qty + excluded.qty,
+    updated_at = excluded.updated_at;
+";
+                    cmd.Parameters.AddWithValue("$k", line.ItemKey);
+                    cmd.Parameters.AddWithValue("$ms", line.Ms);
+                    cmd.Parameters.AddWithValue("$is", line.Isk);
+                    cmd.Parameters.AddWithValue("$in", line.Iname);
+                    cmd.Parameters.AddWithValue("$mn", line.Mname);
+                    cmd.Parameters.AddWithValue("$nr", line.Ms);
+                    cmd.Parameters.AddWithValue("$si", line.Isk);
+                    cmd.Parameters.AddWithValue("$q", line.Qty);
+                    cmd.Parameters.AddWithValue("$t", now);
+                    cmd.ExecuteNonQuery();
+                }
+
+                tx.Commit();
+                return lines.Count;
+            }
+            catch
+            {
+                try { tx.Rollback(); } catch { }
+                throw;
+            }
+        }
+
+        public void DbInventorySetQty(string itemKey, int qty)
+        {
+            if (string.IsNullOrWhiteSpace(itemKey)) return;
+            qty = Math.Max(0, qty);
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            if (qty == 0)
+            {
+                cmd.CommandText = "DELETE FROM product_inventory WHERE item_key = $k;";
+                cmd.Parameters.AddWithValue("$k", itemKey.Trim());
+                cmd.ExecuteNonQuery();
+            }
+            else
+            {
+                cmd.CommandText = "UPDATE product_inventory SET qty = $q, updated_at = $t WHERE item_key = $k;";
+                cmd.Parameters.AddWithValue("$q", qty);
+                cmd.Parameters.AddWithValue("$t", UnixNow());
+                cmd.Parameters.AddWithValue("$k", itemKey.Trim());
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        public void DbInventoryDelete(string itemKey)
+        {
+            if (string.IsNullOrWhiteSpace(itemKey)) return;
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = "DELETE FROM product_inventory WHERE item_key = $k;";
+            cmd.Parameters.AddWithValue("$k", itemKey.Trim());
+            cmd.ExecuteNonQuery();
+        }
+
+        public enum InventoryConsumeOutcome
+        {
+            NoStock,
+            Failed,
+            /// <summary>Stok dipakai sebagian; <c>order_process.qty</c> dikurangi, belum printed.</summary>
+            PartialReducedQty,
+            /// <summary>Stok menutup seluruh qty order; baris ditandai printed.</summary>
+            FullMarkedPrinted
+        }
+
+        /// <summary>
+        /// Pakai stok inventory hingga <paramref name="orderQty"/> (atau sisa stok jika kurang).
+        /// Stok cukup → tandai printed; stok kurang → kurangi qty order, tetap not printed.
+        /// </summary>
+        public InventoryConsumeOutcome DbConsumeInventoryForOrder(long orderProcessId, string itemKey, int orderQty)
+        {
+            if (orderProcessId <= 0 || string.IsNullOrWhiteSpace(itemKey) || orderQty <= 0)
+                return InventoryConsumeOutcome.Failed;
+
+            using var con = OpenDb();
+            con.Open();
+            using var tx = con.BeginTransaction();
+
+            try
+            {
+                int available;
+                using (var cmd = con.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = "SELECT qty FROM product_inventory WHERE item_key = $k;";
+                    cmd.Parameters.AddWithValue("$k", itemKey.Trim());
+                    var scalar = cmd.ExecuteScalar();
+                    if (scalar == null || scalar == DBNull.Value)
+                    {
+                        tx.Rollback();
+                        return InventoryConsumeOutcome.NoStock;
+                    }
+
+                    available = Convert.ToInt32(scalar);
+                }
+
+                if (available <= 0)
+                {
+                    tx.Rollback();
+                    return InventoryConsumeOutcome.NoStock;
+                }
+
+                var use = Math.Min(available, orderQty);
+                var now = UnixNow();
+
+                using (var cmd = con.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = @"
+UPDATE product_inventory
+SET qty = qty - $u, updated_at = $now
+WHERE item_key = $k AND qty >= $u;
+";
+                    cmd.Parameters.AddWithValue("$u", use);
+                    cmd.Parameters.AddWithValue("$now", now);
+                    cmd.Parameters.AddWithValue("$k", itemKey.Trim());
+                    if (cmd.ExecuteNonQuery() != 1)
+                    {
+                        tx.Rollback();
+                        return InventoryConsumeOutcome.Failed;
+                    }
+                }
+
+                if (use < orderQty)
+                {
+                    using (var cmd = con.CreateCommand())
+                    {
+                        cmd.Transaction = tx;
+                        cmd.CommandText = @"
+UPDATE order_process
+SET qty = qty - $u
+WHERE id = $id AND printed = 0 AND qty >= $u;
+";
+                        cmd.Parameters.AddWithValue("$u", use);
+                        cmd.Parameters.AddWithValue("$id", orderProcessId);
+                        if (cmd.ExecuteNonQuery() != 1)
+                        {
+                            tx.Rollback();
+                            return InventoryConsumeOutcome.Failed;
+                        }
+                    }
+
+                    tx.Commit();
+                    return InventoryConsumeOutcome.PartialReducedQty;
+                }
+
+                using (var cmdPrint = con.CreateCommand())
+                {
+                    cmdPrint.Transaction = tx;
+                    cmdPrint.CommandText = @"
+UPDATE order_process
+SET printed = 1, printed_odd = 1, printed_even = 1, printed_at = $t
+WHERE id = $id AND printed = 0;
+";
+                    cmdPrint.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+                    cmdPrint.Parameters.AddWithValue("$id", orderProcessId);
+                    if (cmdPrint.ExecuteNonQuery() != 1)
+                    {
+                        tx.Rollback();
+                        return InventoryConsumeOutcome.Failed;
+                    }
+                }
+
+                tx.Commit();
+                return InventoryConsumeOutcome.FullMarkedPrinted;
+            }
+            catch
+            {
+                try { tx.Rollback(); } catch { }
+                return InventoryConsumeOutcome.Failed;
+            }
+        }
+
+        /// <summary>Search items for inventory picker (same rules as main search index).</summary>
+        public IReadOnlyList<SearchItem> InventoryGetSearchIndex()
+        {
+            return _dataMap.Values
+                .Where(m => !string.IsNullOrWhiteSpace(m.SearchAlias))
+                .Select(m => new SearchItem
+                {
+                    Map = m,
+                    Alias = m.SearchAlias!.Trim(),
+                    Display = m.SearchAlias!.Trim()
+                })
+                .DistinctBy(x => x.Display, StringComparer.OrdinalIgnoreCase)
+                .OrderBy(x => x.Display, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
 private void EnsureDbDirectory()
 {
     var dir = Path.GetDirectoryName(DbFilePath);
@@ -894,26 +1580,616 @@ private void EnsureDbDirectory()
         Directory.CreateDirectory(dir);
 }
 
+        private Dictionary<string, OrderFulfillmentInfo> LoadOrderFulfillmentBatch(IReadOnlyCollection<string> orderSns)
+        {
+            var result = new Dictionary<string, OrderFulfillmentInfo>(StringComparer.OrdinalIgnoreCase);
+            var sns = orderSns
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (sns.Count == 0)
+                return result;
+
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            var placeholders = string.Join(",", sns.Select((_, i) => $"$s{i}"));
+            cmd.CommandText = $@"
+SELECT op.order_sn,
+       SUM(CASE WHEN op.printed = 0 THEN 1 ELSE 0 END),
+       COUNT(*),
+       COALESCE(MAX(r.resi_printed), 0),
+       MAX(CASE WHEN IFNULL(UPPER(TRIM(op.status)), '') = 'CANCELLED' THEN 1 ELSE 0 END)
+FROM order_process op
+LEFT JOIN order_resi r ON r.order_sn = op.order_sn
+WHERE op.order_sn IN ({placeholders})
+GROUP BY op.order_sn;";
+            for (var i = 0; i < sns.Count; i++)
+                cmd.Parameters.AddWithValue($"$s{i}", sns[i]);
+
+            using var rd = cmd.ExecuteReader();
+            while (rd.Read())
+            {
+                var sn = rd.IsDBNull(0) ? "" : rd.GetString(0);
+                if (string.IsNullOrWhiteSpace(sn)) continue;
+                var notPrinted = rd.IsDBNull(1) ? 0 : Convert.ToInt32(rd.GetValue(1));
+                var total = rd.IsDBNull(2) ? 0 : Convert.ToInt32(rd.GetValue(2));
+                var resiPrinted = !rd.IsDBNull(3) && Convert.ToInt32(rd.GetValue(3)) == 1;
+                var isCancelled = !rd.IsDBNull(4) && Convert.ToInt32(rd.GetValue(4)) == 1;
+                result[sn] = OrderFulfillmentInfo.FromAggregate(notPrinted, total, resiPrinted, isCancelled);
+            }
+
+            return result;
+        }
+
+        private (int ReadyOrders, int IncompleteOrders) GetOrderFulfillmentSummaryCounts()
+        {
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = """
+SELECT
+  SUM(CASE WHEN ready = 1 THEN 1 ELSE 0 END),
+  SUM(CASE WHEN ready = 0 THEN 1 ELSE 0 END)
+FROM (
+  SELECT op.order_sn,
+    CASE WHEN SUM(CASE WHEN op.printed = 0 THEN 1 ELSE 0 END) = 0
+              AND COUNT(*) > 0
+              AND COALESCE(MAX(r.resi_printed), 0) = 1
+              AND COALESCE(MAX(o.packaged), 0) = 0 THEN 1 ELSE 0 END AS ready
+  FROM order_process op
+  LEFT JOIN order_resi r ON r.order_sn = op.order_sn
+  LEFT JOIN orders o ON o.order_sn = op.order_sn
+  WHERE (IFNULL(UPPER(TRIM(op.status)), '') <> 'CANCELLED')
+    AND COALESCE(o.packaged, 0) = 0
+  GROUP BY op.order_sn
+) t;
+""";
+            using var rd = cmd.ExecuteReader();
+            if (!rd.Read())
+                return (0, 0);
+            var ready = rd.IsDBNull(0) ? 0 : Convert.ToInt32(rd.GetValue(0));
+            var incomplete = rd.IsDBNull(1) ? 0 : Convert.ToInt32(rd.GetValue(1));
+            return (ready, incomplete);
+        }
+
+        private void UpdateOrderFulfillmentSummaryUi()
+        {
+            if (TxtOrderSummary == null)
+                return;
+            var (ready, incomplete) = GetOrderFulfillmentSummaryCounts();
+            var packaged = GetPackOrderCount(packagedOnly: true);
+            TxtOrderSummary.Text =
+                $"Menunggu dibungkus: {ready} order · Belum siap: {incomplete} order · Sudah dibungkus: {packaged} order";
+        }
+
+        private void RefreshOrderFulfillmentOnRows()
+        {
+            var sns = Rows.Select(r => r.OrderNo).Where(s => !string.IsNullOrWhiteSpace(s)).ToList();
+            var map = LoadOrderFulfillmentBatch(sns);
+            foreach (var row in Rows)
+            {
+                if (string.IsNullOrWhiteSpace(row.OrderNo))
+                    continue;
+                map.TryGetValue(row.OrderNo, out var info);
+                row.ApplyOrderFulfillment(info);
+            }
+
+            UpdateOrderFulfillmentSummaryUi();
+        }
+
+        private Dictionary<string, (int NotPrinted, int Total)> LoadProductPrintProgressForResiBatch(
+            IReadOnlyCollection<string> orderSns)
+        {
+            var result = new Dictionary<string, (int NotPrinted, int Total)>(StringComparer.OrdinalIgnoreCase);
+            var sns = orderSns
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (sns.Count == 0)
+                return result;
+
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            var placeholders = string.Join(",", sns.Select((_, i) => $"$s{i}"));
+            cmd.CommandText = $@"
+SELECT op.order_sn,
+       SUM(CASE WHEN op.printed = 0 THEN 1 ELSE 0 END),
+       COUNT(*)
+FROM order_process op
+WHERE op.order_sn IN ({placeholders})
+  AND (IFNULL(UPPER(TRIM(op.status)), '') <> 'CANCELLED')
+GROUP BY op.order_sn;";
+            for (var i = 0; i < sns.Count; i++)
+                cmd.Parameters.AddWithValue($"$s{i}", sns[i]);
+
+            using var rd = cmd.ExecuteReader();
+            while (rd.Read())
+            {
+                var sn = rd.IsDBNull(0) ? "" : rd.GetString(0);
+                if (string.IsNullOrWhiteSpace(sn)) continue;
+                var notPrinted = rd.IsDBNull(1) ? 0 : Convert.ToInt32(rd.GetValue(1));
+                var total = rd.IsDBNull(2) ? 0 : Convert.ToInt32(rd.GetValue(2));
+                result[sn] = (notPrinted, total);
+            }
+
+            return result;
+        }
+
+        private void DbSetOrderPackaged(string orderSn, bool packaged)
+        {
+            if (string.IsNullOrWhiteSpace(orderSn))
+                return;
+
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = """
+INSERT INTO orders(order_sn, packaged, packaged_at, create_time, update_time)
+VALUES($sn, $p, CASE WHEN $p = 1 THEN $t ELSE NULL END, $t, $t)
+ON CONFLICT(order_sn) DO UPDATE SET
+  packaged = excluded.packaged,
+  packaged_at = excluded.packaged_at,
+  update_time = excluded.update_time;
+""";
+            cmd.Parameters.AddWithValue("$p", packaged ? 1 : 0);
+            cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$sn", orderSn.Trim());
+            cmd.ExecuteNonQuery();
+        }
+
+        private int GetPackOrderCount(bool packagedOnly)
+        {
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = $"""
+SELECT COUNT(DISTINCT op.order_sn)
+FROM order_process op
+LEFT JOIN orders o ON o.order_sn = op.order_sn
+WHERE {SqlOpOrderNotCancelled}
+  AND COALESCE(o.packaged, 0) = $packaged;
+""";
+            cmd.Parameters.AddWithValue("$packaged", packagedOnly ? 1 : 0);
+            return Convert.ToInt32(cmd.ExecuteScalar() ?? 0);
+        }
+
+        private void LoadPackPageFromDb(int pageIndex)
+        {
+            var packagedOnly = _currentTabFilter == ShopeeTabFilter.Packaged;
+            _shopeeTotalItems = GetPackOrderCount(packagedOnly);
+            var maxPageIndex = Math.Max(0, (int)Math.Ceiling(_shopeeTotalItems / (double)ShopeePageSize) - 1);
+            _shopeePageIndex = Math.Max(0, Math.Min(pageIndex, maxPageIndex));
+
+            if (packagedOnly)
+                _pageIndexPackaged = _shopeePageIndex;
+            else
+                _pageIndexReadyToPack = _shopeePageIndex;
+
+            var skip = _shopeePageIndex * ShopeePageSize;
+            PackRows.Clear();
+
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = packagedOnly
+                ? $"""
+SELECT op.order_sn,
+       MAX(op.create_time),
+       SUM(CASE WHEN op.printed = 0 THEN 1 ELSE 0 END),
+       COUNT(*),
+       COALESCE(MAX(r.resi_printed), 0),
+       1,
+       MAX(CASE WHEN IFNULL(UPPER(TRIM(op.status)), '') = 'CANCELLED' THEN 1 ELSE 0 END),
+       MAX(o.packaged_at)
+FROM order_process op
+LEFT JOIN order_resi r ON r.order_sn = op.order_sn
+LEFT JOIN orders o ON o.order_sn = op.order_sn
+WHERE {SqlOpOrderNotCancelled}
+  AND COALESCE(o.packaged, 0) = 1
+GROUP BY op.order_sn
+ORDER BY MAX(o.packaged_at) DESC, MAX(op.create_time) DESC
+LIMIT $take OFFSET $skip;
+"""
+                : $"""
+SELECT op.order_sn,
+       MAX(op.create_time),
+       SUM(CASE WHEN op.printed = 0 THEN 1 ELSE 0 END),
+       COUNT(*),
+       COALESCE(MAX(r.resi_printed), 0),
+       COALESCE(MAX(o.packaged), 0),
+       MAX(CASE WHEN IFNULL(UPPER(TRIM(op.status)), '') = 'CANCELLED' THEN 1 ELSE 0 END),
+       MAX(o.packaged_at)
+FROM order_process op
+LEFT JOIN order_resi r ON r.order_sn = op.order_sn
+LEFT JOIN orders o ON o.order_sn = op.order_sn
+WHERE {SqlOpOrderNotCancelled}
+  AND COALESCE(o.packaged, 0) = 0
+GROUP BY op.order_sn
+ORDER BY
+  CASE WHEN SUM(CASE WHEN op.printed = 0 THEN 1 ELSE 0 END) = 0
+            AND COUNT(*) > 0
+            AND COALESCE(MAX(r.resi_printed), 0) = 1 THEN 0 ELSE 1 END,
+  MAX(op.create_time) DESC
+LIMIT $take OFFSET $skip;
+""";
+            cmd.Parameters.AddWithValue("$take", ShopeePageSize);
+            cmd.Parameters.AddWithValue("$skip", skip);
+
+            var idx = skip + 1;
+            using var rd = cmd.ExecuteReader();
+            while (rd.Read())
+            {
+                var sn = rd.IsDBNull(0) ? "" : rd.GetString(0);
+                if (string.IsNullOrWhiteSpace(sn)) continue;
+
+                var createT = rd.IsDBNull(1) ? 0 : rd.GetInt64(1);
+                var notPrinted = rd.IsDBNull(2) ? 0 : Convert.ToInt32(rd.GetValue(2));
+                var total = rd.IsDBNull(3) ? 0 : Convert.ToInt32(rd.GetValue(3));
+                var resiPrinted = !rd.IsDBNull(4) && Convert.ToInt32(rd.GetValue(4)) == 1;
+                var packaged = !rd.IsDBNull(5) && Convert.ToInt32(rd.GetValue(5)) == 1;
+                var isCancelled = !rd.IsDBNull(6) && Convert.ToInt32(rd.GetValue(6)) == 1;
+                var packagedAt = rd.IsDBNull(7) ? 0 : rd.GetInt64(7);
+
+                var info = OrderFulfillmentInfo.FromAggregate(notPrinted, total, resiPrinted, isCancelled);
+                var packagedAtText = packagedAt > 0
+                    ? DateTimeOffset.FromUnixTimeSeconds(packagedAt).ToLocalTime()
+                        .ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)
+                    : "";
+
+                PackRows.Add(new PackOrderRow
+                {
+                    Index = idx++,
+                    OrderSn = sn,
+                    OrderCreatedText = createT > 0
+                        ? UnixToLocalDateTime(createT)?.ToString("yyyy-MM-dd HH:mm") ?? ""
+                        : "",
+                    LineCount = total,
+                    FulfillmentStatus = info.Status,
+                    PackMissingDescription = packaged
+                        ? (string.IsNullOrEmpty(packagedAtText)
+                            ? "Sudah dibungkus"
+                            : $"Sudah dibungkus · {packagedAtText}")
+                        : info.GetPackMissingDescription(),
+                    IsPackaged = packaged,
+                    PackagedAtText = packagedAtText
+                });
+            }
+
+            UpdateShopeePagingUi();
+            UpdateOrderFulfillmentSummaryUi();
+            UpdateProductTabPanelsVisibility();
+        }
+
+        private void UpdateProductTabPanelsVisibility()
+        {
+            var isPackTab = _currentTabFilter == ShopeeTabFilter.ReadyToPack
+                            || _currentTabFilter == ShopeeTabFilter.Packaged;
+            if (QueueGrid != null)
+                QueueGrid.Visibility = isPackTab ? Visibility.Collapsed : Visibility.Visible;
+            if (PackGrid != null)
+                PackGrid.Visibility = isPackTab ? Visibility.Visible : Visibility.Collapsed;
+            if (TxtPackTabHint != null)
+            {
+                TxtPackTabHint.Visibility = isPackTab ? Visibility.Visible : Visibility.Collapsed;
+                TxtPackTabHint.Text = _currentTabFilter == ShopeeTabFilter.Packaged
+                    ? "Order yang sudah ditandai dibungkus. Klik «Batalkan tandai» jika salah."
+                    : "Satu baris = satu order. Order hijau siap dibungkus. Order lain menampilkan apa yang masih kurang.";
+            }
+            if (SearchBox != null)
+                SearchBox.IsEnabled = !isPackTab;
+        }
+
+        public OrderPackDetailInfo BuildOrderPackDetail(string orderSn)
+        {
+            var sn = (orderSn ?? "").Trim();
+            var lines = new List<OrderPackDetailLine>();
+            var notesText = "";
+            if (string.IsNullOrEmpty(sn))
+            {
+                return new OrderPackDetailInfo
+                {
+                    OrderSn = sn,
+                    ResiStatusText = "",
+                    PrintSummaryText = "Tidak ada data.",
+                    PackSummaryText = "",
+                    NotesText = "",
+                    Lines = lines
+                };
+            }
+
+            var notPrinted = 0;
+            var total = 0;
+            var resiPrinted = false;
+            var packaged = false;
+            var packagedAtText = "";
+
+            using (var con = OpenDb())
+            {
+                con.Open();
+
+                using (var cmd = con.CreateCommand())
+                {
+                    cmd.CommandText = """
+SELECT item_name, model_name, qty, printed, printed_odd, printed_even
+FROM order_process
+WHERE order_sn = $sn
+ORDER BY id;
+""";
+                    cmd.Parameters.AddWithValue("$sn", sn);
+                    using var rd = cmd.ExecuteReader();
+                    var idx = 1;
+                    while (rd.Read())
+                    {
+                        var itemName = rd.IsDBNull(0) ? "" : rd.GetString(0);
+                        var modelName = rd.IsDBNull(1) ? "" : rd.GetString(1);
+                        var qty = rd.IsDBNull(2) ? 1 : rd.GetInt32(2);
+                        var printed = !rd.IsDBNull(3) && rd.GetInt32(3) == 1;
+                        var odd = !rd.IsDBNull(4) && rd.GetInt32(4) == 1;
+                        var even = !rd.IsDBNull(5) && rd.GetInt32(5) == 1;
+
+                        total++;
+                        if (!printed) notPrinted++;
+
+                        var sides = printed
+                            ? $"Odd:{(odd ? "Y" : "N")} Even:{(even ? "Y" : "N")}"
+                            : "—";
+
+                        lines.Add(new OrderPackDetailLine
+                        {
+                            Index = idx++,
+                            ItemName = itemName,
+                            ModelName = modelName,
+                            Qty = Math.Max(1, qty),
+                            IsPrinted = printed,
+                            PrintSidesLabel = sides
+                        });
+                    }
+                }
+
+                using (var cmd = con.CreateCommand())
+                {
+                    cmd.CommandText = """
+SELECT COALESCE(r.resi_printed, 0), COALESCE(o.packaged, 0), o.packaged_at
+FROM order_process op
+LEFT JOIN orders o ON o.order_sn = op.order_sn
+LEFT JOIN order_resi r ON r.order_sn = op.order_sn
+WHERE op.order_sn = $sn
+LIMIT 1;
+""";
+                    cmd.Parameters.AddWithValue("$sn", sn);
+                    using var rd = cmd.ExecuteReader();
+                    if (rd.Read())
+                    {
+                        resiPrinted = !rd.IsDBNull(0) && rd.GetInt32(0) == 1;
+                        packaged = !rd.IsDBNull(1) && rd.GetInt32(1) == 1;
+                        if (!rd.IsDBNull(2))
+                        {
+                            var at = rd.GetInt64(2);
+                            if (at > 0)
+                                packagedAtText = DateTimeOffset.FromUnixTimeSeconds(at).ToLocalTime()
+                                    .ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
+                        }
+                    }
+                }
+
+                using (var cmd = con.CreateCommand())
+                {
+                    cmd.CommandText = """
+SELECT raw_json
+FROM orders
+WHERE order_sn = $sn
+LIMIT 1;
+""";
+                    cmd.Parameters.AddWithValue("$sn", sn);
+                    using var rd = cmd.ExecuteReader();
+                    if (rd.Read() && !rd.IsDBNull(0))
+                        notesText = ExtractOrderNotesText(rd.GetString(0));
+                }
+            }
+
+            var printedCount = total - notPrinted;
+            var info = OrderFulfillmentInfo.FromAggregate(notPrinted, total, resiPrinted, false);
+
+            return new OrderPackDetailInfo
+            {
+                OrderSn = sn,
+                ResiStatusText = resiPrinted
+                    ? "Label pengiriman: sudah dicetak"
+                    : "Label pengiriman: belum dicetak",
+                PrintSummaryText = total > 0
+                    ? $"Cetak produk: {printedCount}/{total} baris sudah dicetak"
+                    : "Tidak ada baris produk di database.",
+                PackSummaryText = packaged
+                    ? (string.IsNullOrEmpty(packagedAtText)
+                        ? "Status bungkus: sudah dibungkus"
+                        : $"Status bungkus: sudah dibungkus ({packagedAtText})")
+                    : $"Status bungkus: {info.GetPackMissingDescription()}",
+                NotesText = string.IsNullOrWhiteSpace(notesText)
+                    ? "Tidak ada catatan yang ditemukan di data order."
+                    : notesText,
+                Lines = lines
+            };
+        }
+
+        private static string ExtractOrderNotesText(string rawJson)
+        {
+            if (string.IsNullOrWhiteSpace(rawJson))
+                return "";
+
+            try
+            {
+                using var doc = JsonDocument.Parse(rawJson);
+                var notes = new List<string>();
+                CollectOrderNotes(doc.RootElement, notes, 0);
+
+                if (notes.Count == 0)
+                    return "";
+
+                var unique = new List<string>();
+                var seen = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var note in notes)
+                {
+                    if (string.IsNullOrWhiteSpace(note))
+                        continue;
+                    if (!seen.Add(note))
+                        continue;
+                    unique.Add(note);
+                }
+
+                return string.Join(Environment.NewLine + Environment.NewLine, unique);
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private static void CollectOrderNotes(JsonElement element, List<string> notes, int depth)
+        {
+            if (depth > 10)
+                return;
+
+            switch (element.ValueKind)
+            {
+                case JsonValueKind.Object:
+                    foreach (var prop in element.EnumerateObject())
+                    {
+                        var name = prop.Name;
+                        if (IsLikelyOrderNoteField(name))
+                        {
+                            var text = ExtractNoteText(prop.Value);
+                            if (!string.IsNullOrWhiteSpace(text))
+                                notes.Add($"{FormatNoteLabel(name)}: {text}");
+                        }
+
+                        if (prop.Value.ValueKind is JsonValueKind.Object or JsonValueKind.Array)
+                            CollectOrderNotes(prop.Value, notes, depth + 1);
+                    }
+                    break;
+
+                case JsonValueKind.Array:
+                    foreach (var item in element.EnumerateArray())
+                    {
+                        if (item.ValueKind is JsonValueKind.Object or JsonValueKind.Array)
+                            CollectOrderNotes(item, notes, depth + 1);
+                    }
+                    break;
+            }
+        }
+
+        private static bool IsLikelyOrderNoteField(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return false;
+
+            var n = name.Trim().ToLowerInvariant();
+            return n is "note"
+                or "notes"
+                or "remark"
+                or "remarks"
+                or "note_to_seller"
+                or "buyer_note"
+                or "buyer_user_note"
+                or "buyer_message_to_seller"
+                or "message_to_seller"
+                or "order_note"
+                or "customer_note"
+                or "special_note"
+                or "special_notes"
+                || n.Contains("note")
+                || n.Contains("remark");
+        }
+
+        private static string? ExtractNoteText(JsonElement value)
+        {
+            return value.ValueKind switch
+            {
+                JsonValueKind.String => value.GetString()?.Trim(),
+                JsonValueKind.Number => value.ToString(),
+                JsonValueKind.True => "True",
+                JsonValueKind.False => "False",
+                _ => null
+            };
+        }
+
+        private static string FormatNoteLabel(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return "Catatan";
+
+            var pretty = name.Replace('_', ' ').Trim();
+            return CultureInfo.InvariantCulture.TextInfo.ToTitleCase(pretty.ToLowerInvariant());
+        }
+
+        private void PackOrderViewDetail_Click(object sender, RoutedEventArgs e)
+        {
+            if ((sender as FrameworkElement)?.DataContext is not PackOrderRow row)
+                return;
+            if (string.IsNullOrWhiteSpace(row.OrderSn))
+                return;
+
+            var info = BuildOrderPackDetail(row.OrderSn);
+            var w = new OrderPackDetailWindow(info) { Owner = this };
+            w.ShowDialog();
+        }
+
+        private void MarkOrderPackaged_Click(object sender, RoutedEventArgs e)
+        {
+            if ((sender as FrameworkElement)?.DataContext is not PackOrderRow row)
+                return;
+            if (!row.CanMarkPackaged)
+                return;
+
+            DbSetOrderPackaged(row.OrderSn, true);
+            if (Rows.Count > 0)
+                RefreshOrderFulfillmentOnRows();
+            LoadShopeePageFromDb(_shopeePageIndex);
+        }
+
+        private void MarkOrderUnPackaged_Click(object sender, RoutedEventArgs e)
+        {
+            if ((sender as FrameworkElement)?.DataContext is not PackOrderRow row)
+                return;
+            if (!row.CanUndoPackaged)
+                return;
+
+            DbSetOrderPackaged(row.OrderSn, false);
+            if (Rows.Count > 0)
+                RefreshOrderFulfillmentOnRows();
+            LoadShopeePageFromDb(_shopeePageIndex);
+        }
+
         private int GetOrderProcessCount()
         {
+            if (_currentTabFilter == ShopeeTabFilter.ReadyToPack)
+                return GetPackOrderCount(packagedOnly: false);
+            if (_currentTabFilter == ShopeeTabFilter.Packaged)
+                return GetPackOrderCount(packagedOnly: true);
+
             using var con = OpenDb();
             con.Open();
 
             using var cmd = con.CreateCommand();
 
-            // Hitung jumlah row sesuai tab aktif
+            // Hitung jumlah row sesuai tab aktif (CANCELLED hanya di tab Cancel)
             switch (_currentTabFilter)
             {
                 case ShopeeTabFilter.All:
-                    cmd.CommandText = "SELECT COUNT(*) FROM order_process;";
+                    cmd.CommandText = $"SELECT COUNT(*) FROM order_process WHERE {SqlOrderNotCancelled};";
                     break;
 
                 case ShopeeTabFilter.NotPrinted:
-                    cmd.CommandText = "SELECT COUNT(*) FROM order_process WHERE printed = 0;";
+                    cmd.CommandText = $"SELECT COUNT(*) FROM order_process WHERE printed = 0 AND {SqlOrderNotCancelled};";
                     break;
 
                 case ShopeeTabFilter.Printed:
-                    cmd.CommandText = "SELECT COUNT(*) FROM order_process WHERE printed = 1;";
+                    cmd.CommandText = $"SELECT COUNT(*) FROM order_process WHERE printed = 1 AND {SqlOrderNotCancelled};";
+                    break;
+
+                case ShopeeTabFilter.Cancelled:
+                    cmd.CommandText = $"SELECT COUNT(*) FROM order_process WHERE {SqlOrderIsCancelled};";
                     break;
             }
 
@@ -925,6 +2201,14 @@ private void EnsureDbDirectory()
 
         private void LoadShopeePageFromDb(int pageIndex)
         {
+            if (_currentTabFilter is ShopeeTabFilter.ReadyToPack or ShopeeTabFilter.Packaged)
+            {
+                LoadPackPageFromDb(pageIndex);
+                return;
+            }
+
+            UpdateProductTabPanelsVisibility();
+
             // hitung total item sesuai tab aktif (All / NotPrinted / Printed)
             _shopeeTotalItems = GetOrderProcessCount();
 
@@ -946,8 +2230,18 @@ private void EnsureDbDirectory()
                 case ShopeeTabFilter.Printed:
                     _pageIndexPrinted = _shopeePageIndex;
                     break;
+                case ShopeeTabFilter.ReadyToPack:
+                    _pageIndexReadyToPack = _shopeePageIndex;
+                    break;
+                case ShopeeTabFilter.Packaged:
+                    _pageIndexPackaged = _shopeePageIndex;
+                    break;
+                case ShopeeTabFilter.Cancelled:
+                    _pageIndexCancelled = _shopeePageIndex;
+                    break;
             }
 
+            DeleteTempMergedPdfsForAllRowsInQueue();
             Rows.Clear();
 
             using var con = OpenDb();
@@ -955,15 +2249,17 @@ private void EnsureDbDirectory()
 
             using var cmd = con.CreateCommand();
 
-            // bikin WHERE sesuai tab aktif
-            string whereClause = "";
-            if (_currentTabFilter == ShopeeTabFilter.NotPrinted)
-                whereClause = "WHERE printed = 0\n";
-            else if (_currentTabFilter == ShopeeTabFilter.Printed)
-                whereClause = "WHERE printed = 1\n";
+            // bikin WHERE sesuai tab aktif (IN_CANCEL tetap di Not Printed; CANCELLED hanya di tab Cancel)
+            var whereClause = _currentTabFilter switch
+            {
+                ShopeeTabFilter.NotPrinted => $"WHERE printed = 0 AND {SqlOrderNotCancelled}\n",
+                ShopeeTabFilter.Printed => $"WHERE printed = 1 AND {SqlOrderNotCancelled}\n",
+                ShopeeTabFilter.Cancelled => $"WHERE {SqlOrderIsCancelled}\n",
+                _ => $"WHERE {SqlOrderNotCancelled}\n"
+            };
 
             cmd.CommandText = $@"
-SELECT id, order_sn, item_key, model_sku, item_sku, item_name, model_name, qty, status, create_time, printed
+SELECT id, order_sn, item_key, model_sku, item_sku, item_name, model_name, qty, status, create_time, printed, printed_odd, printed_even
 FROM order_process
 {whereClause}ORDER BY create_time DESC, id DESC
 LIMIT $take OFFSET $skip;
@@ -982,8 +2278,11 @@ LIMIT $take OFFSET $skip;
                 var itemName = rd.IsDBNull(5) ? "" : rd.GetString(5);
                 var modelName = rd.IsDBNull(6) ? "" : rd.GetString(6);
                 var qty = rd.IsDBNull(7) ? 1 : rd.GetInt32(7);
+                var orderStatus = rd.IsDBNull(8) ? "" : rd.GetString(8);
                 var createT = rd.IsDBNull(9) ? 0 : rd.GetInt64(9);
                 var ordPrinted = rd.GetOrdinal("printed");
+                var ordPrintedOdd = rd.GetOrdinal("printed_odd");
+                var ordPrintedEven = rd.GetOrdinal("printed_even");
 
                 _dataMap.TryGetValue(itemKey, out var map);
 
@@ -1018,7 +2317,6 @@ LIMIT $take OFFSET $skip;
                         Percent = 0,
                         TotalPages = 0
                     };
-                    row.IsPrinted = !rd.IsDBNull(ordPrinted) && rd.GetInt32(ordPrinted) == 1;
 
                 }
                 else
@@ -1039,12 +2337,20 @@ LIMIT $take OFFSET $skip;
                     };
                 }
 
-                                row.IsPrinted = !rd.IsDBNull(ordPrinted) && rd.GetInt32(ordPrinted) == 1;
-                row.CanTogglePrinted = row.OrderProcessId > 0;
+                row.OrderItemQty = Math.Max(0, qty);
+                _inventoryQty.TryGetValue(itemKey, out var invStk);
+                row.InventoryAvailableQty = invStk;
+
+                row.IsPrinted = !rd.IsDBNull(ordPrinted) && rd.GetInt32(ordPrinted) == 1;
+                row.PrintedOddSide = !rd.IsDBNull(ordPrintedOdd) && rd.GetInt32(ordPrintedOdd) == 1;
+                row.PrintedEvenSide = !rd.IsDBNull(ordPrintedEven) && rd.GetInt32(ordPrintedEven) == 1;
+                row.ShopeeOrderStatus = orderStatus;
+                row.CanTogglePrinted = row.OrderProcessId > 0 && !row.IsShopeeOrderCancelled;
 
                 Rows.Add(row);
             }
 
+            RefreshOrderFulfillmentOnRows();
             UpdateShopeePagingUi();
             RefreshViews();
         }
@@ -1065,6 +2371,15 @@ LIMIT $take OFFSET $skip;
                 case ShopeeTabFilter.Printed:
                     _pageIndexPrinted = _shopeePageIndex;
                     break;
+                case ShopeeTabFilter.ReadyToPack:
+                    _pageIndexReadyToPack = _shopeePageIndex;
+                    break;
+                case ShopeeTabFilter.Packaged:
+                    _pageIndexPackaged = _shopeePageIndex;
+                    break;
+                case ShopeeTabFilter.Cancelled:
+                    _pageIndexCancelled = _shopeePageIndex;
+                    break;
             }
 
             // Tentukan filter baru & restore page index-nya
@@ -1076,7 +2391,6 @@ LIMIT $take OFFSET $skip;
                     break;
 
                 case 1: // Not Printed
-                default:
                     _currentTabFilter = ShopeeTabFilter.NotPrinted;
                     _shopeePageIndex = _pageIndexNotPrinted;
                     break;
@@ -1084,6 +2398,26 @@ LIMIT $take OFFSET $skip;
                 case 2: // Printed
                     _currentTabFilter = ShopeeTabFilter.Printed;
                     _shopeePageIndex = _pageIndexPrinted;
+                    break;
+
+                case 3: // Siap bungkus
+                    _currentTabFilter = ShopeeTabFilter.ReadyToPack;
+                    _shopeePageIndex = _pageIndexReadyToPack;
+                    break;
+
+                case 4: // Sudah dibungkus
+                    _currentTabFilter = ShopeeTabFilter.Packaged;
+                    _shopeePageIndex = _pageIndexPackaged;
+                    break;
+
+                case 5: // Cancel (CANCELLED)
+                    _currentTabFilter = ShopeeTabFilter.Cancelled;
+                    _shopeePageIndex = _pageIndexCancelled;
+                    break;
+
+                default:
+                    _currentTabFilter = ShopeeTabFilter.NotPrinted;
+                    _shopeePageIndex = _pageIndexNotPrinted;
                     break;
             }
 
@@ -1095,8 +2429,10 @@ LIMIT $take OFFSET $skip;
         {
             var totalPages = Math.Max(1, (int)Math.Ceiling(_shopeeTotalItems / (double)ShopeePageSize));
 
-            // Ini butuh 3 control di XAML (lihat step 3)
-            TxtShopeePage.Text = $"Page {_shopeePageIndex + 1} / {totalPages}  (Total: {_shopeeTotalItems})";
+            var unit = _currentTabFilter is ShopeeTabFilter.ReadyToPack or ShopeeTabFilter.Packaged
+                ? "order"
+                : "baris";
+            TxtShopeePage.Text = $"Page {_shopeePageIndex + 1} / {totalPages}  (Total: {_shopeeTotalItems} {unit})";
 
             BtnShopeePrev.IsEnabled = _shopeePageIndex > 0;
             BtnShopeeNext.IsEnabled = (_shopeePageIndex + 1) < totalPages;
@@ -1150,8 +2486,11 @@ private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
 
 private void InitDatabase()
 {
-    using var con = OpenDb();
+    Paperbell_App.App.Trace("InitDatabase: OpenDb");
+    using (var con = OpenDb())
+    {
     con.Open();
+    Paperbell_App.App.Trace("InitDatabase: connection opened");
 
     using var cmd = con.CreateCommand();
     cmd.CommandText =
@@ -1172,6 +2511,7 @@ private void InitDatabase()
         CREATE TABLE IF NOT EXISTS order_process (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             order_sn TEXT,
+            order_item_id TEXT NOT NULL DEFAULT '',
             item_key TEXT,
             model_sku TEXT,
             item_sku TEXT,
@@ -1182,8 +2522,10 @@ private void InitDatabase()
             create_time INTEGER,
             saved_at INTEGER,
             printed INTEGER DEFAULT 0,
+            printed_odd INTEGER NOT NULL DEFAULT 0,
+            printed_even INTEGER NOT NULL DEFAULT 0,
             printed_at INTEGER,
-            UNIQUE(order_sn, item_key)
+            UNIQUE(order_sn, order_item_id)
         );
 
         CREATE TABLE IF NOT EXISTS order_resi (
@@ -1193,9 +2535,233 @@ private void InitDatabase()
             resi_printed INTEGER DEFAULT 0,
             resi_printed_at INTEGER
         );
+
+        CREATE TABLE IF NOT EXISTS product_inventory (
+            item_key   TEXT PRIMARY KEY,
+            model_sku  TEXT,
+            item_sku   TEXT,
+            item_name  TEXT,
+            model_name TEXT,
+            no_ref     TEXT,
+            sku_induk  TEXT,
+            qty        INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER
+        );
         """;
+    Paperbell_App.App.Trace("InitDatabase: CREATE TABLE start");
     cmd.ExecuteNonQuery();
+    Paperbell_App.App.Trace("InitDatabase: CREATE TABLE done");
+    MigrateOrderProcessLineUnique(con);
+    Paperbell_App.App.Trace("InitDatabase: MigrateOrderProcessLineUnique done");
+    EnsureOrderProcessPrintedSideColumns(con);
+    Paperbell_App.App.Trace("InitDatabase: EnsureOrderProcessPrintedSideColumns done");
+    EnsureOrdersPackagedColumns(con);
+    Paperbell_App.App.Trace("InitDatabase: EnsureOrdersPackagedColumns done");
+    } // con disposed di sini agar tidak bentrok dengan rebuild
+    RebuildAllOrderProcessLinesFromRawJson();
+    Paperbell_App.App.Trace("InitDatabase: Rebuild done");
+    BackfillMarchOrdersPackagedOnce();
 }
+
+        /// <summary>Batas WIB: order dibuat sebelum 1 April 2026 = Maret ke bawah.</summary>
+        private static long PackBackfillCutoffApril2026WibUnix() =>
+            new DateTimeOffset(2026, 4, 1, 0, 0, 0, TimeSpan.FromHours(7)).ToUnixTimeSeconds();
+
+        /// <summary>Sekali jalan: order dibuat Maret ke bawah (sebelum 1 Apr 2026 WIB) ditandai sudah dibungkus.</summary>
+        private void BackfillMarchOrdersPackagedOnce()
+        {
+            try
+            {
+                using var con = OpenDb();
+                con.Open();
+                if (!TableHasColumn(con, "orders", "packaged"))
+                    return;
+
+                using (var gate = con.CreateCommand())
+                {
+                    gate.CommandText = "SELECT value FROM app_state WHERE key = 'backfill_through_march2026_packaged_v1' LIMIT 1;";
+                    if (string.Equals(gate.ExecuteScalar() as string, "1", StringComparison.Ordinal))
+                        return;
+                }
+
+                var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                var cutoff = PackBackfillCutoffApril2026WibUnix();
+                using var tx = con.BeginTransaction();
+                try
+                {
+                    using (var cmd = con.CreateCommand())
+                    {
+                        cmd.Transaction = tx;
+                        cmd.CommandText = """
+INSERT INTO orders(order_sn, packaged, packaged_at, create_time, update_time)
+SELECT g.order_sn, 1, $now, g.create_time, $now
+FROM (
+  SELECT op.order_sn, MAX(op.create_time) AS create_time
+  FROM order_process op
+  WHERE op.create_time < $cutoff
+    AND (IFNULL(UPPER(TRIM(op.status)), '') <> 'CANCELLED')
+  GROUP BY op.order_sn
+) g
+ON CONFLICT(order_sn) DO UPDATE SET
+  packaged = 1,
+  packaged_at = COALESCE(orders.packaged_at, excluded.packaged_at),
+  update_time = excluded.update_time;
+""";
+                        cmd.Parameters.AddWithValue("$now", now);
+                        cmd.Parameters.AddWithValue("$cutoff", cutoff);
+                        cmd.ExecuteNonQuery();
+                    }
+
+                    using (var st = con.CreateCommand())
+                    {
+                        st.Transaction = tx;
+                        st.CommandText = """
+INSERT INTO app_state(key, value) VALUES('backfill_through_march2026_packaged_v1', '1')
+ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+""";
+                        st.ExecuteNonQuery();
+                    }
+
+                    tx.Commit();
+                    Paperbell_App.App.Trace("BackfillMarchOrdersPackagedOnce: done (through Mar 2026 WIB)");
+                }
+                catch
+                {
+                    try { tx.Rollback(); } catch { }
+                    throw;
+                }
+            }
+            catch (Exception ex)
+            {
+                Paperbell_App.App.Trace("BackfillMarchOrdersPackagedOnce FAILED: " + ex);
+            }
+        }
+
+        private static void EnsureOrdersPackagedColumns(SqliteConnection con)
+        {
+            if (!TableHasColumn(con, "orders", "packaged"))
+            {
+                using var cmd = con.CreateCommand();
+                cmd.CommandText = "ALTER TABLE orders ADD COLUMN packaged INTEGER NOT NULL DEFAULT 0;";
+                cmd.ExecuteNonQuery();
+            }
+
+            if (!TableHasColumn(con, "orders", "packaged_at"))
+            {
+                using var cmd = con.CreateCommand();
+                cmd.CommandText = "ALTER TABLE orders ADD COLUMN packaged_at INTEGER;";
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static bool TableHasColumn(SqliteConnection con, string table, string column)
+        {
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = $"PRAGMA table_info({table});";
+            using var rd = cmd.ExecuteReader();
+            while (rd.Read())
+            {
+                if (string.Equals(rd.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>Upgrade DB lama: unik per baris Shopee (<c>order_item_id</c>), bukan hanya SKU gabungan.</summary>
+        private static void MigrateOrderProcessLineUnique(SqliteConnection con)
+        {
+            if (TableHasColumn(con, "order_process", "order_item_id"))
+                return;
+
+            using var tx = con.BeginTransaction();
+            try
+            {
+                using (var cmd = con.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText =
+                        """
+                        CREATE TABLE order_process_new (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            order_sn TEXT,
+                            order_item_id TEXT NOT NULL,
+                            item_key TEXT,
+                            model_sku TEXT,
+                            item_sku TEXT,
+                            item_name TEXT,
+                            model_name TEXT,
+                            qty INTEGER,
+                            status TEXT,
+                            create_time INTEGER,
+                            saved_at INTEGER,
+                            printed INTEGER DEFAULT 0,
+                            printed_odd INTEGER NOT NULL DEFAULT 0,
+                            printed_even INTEGER NOT NULL DEFAULT 0,
+                            printed_at INTEGER,
+                            UNIQUE(order_sn, order_item_id)
+                        );
+
+                        INSERT INTO order_process_new(
+                            id, order_sn, order_item_id, item_key, model_sku, item_sku, item_name, model_name,
+                            qty, status, create_time, saved_at, printed, printed_odd, printed_even, printed_at)
+                        SELECT
+                            id, order_sn, 'legacy:' || id, item_key, model_sku, item_sku, item_name, model_name,
+                            qty, status, create_time, saved_at, printed,
+                            CASE WHEN printed = 1 THEN 1 ELSE 0 END,
+                            CASE WHEN printed = 1 THEN 1 ELSE 0 END,
+                            printed_at
+                        FROM order_process;
+
+                        DROP TABLE order_process;
+                        ALTER TABLE order_process_new RENAME TO order_process;
+                        """;
+                    cmd.ExecuteNonQuery();
+                }
+                tx.Commit();
+            }
+            catch
+            {
+                tx.Rollback();
+                throw;
+            }
+        }
+
+        private static void EnsureOrderProcessPrintedSideColumns(SqliteConnection con)
+        {
+            // SQLite ALTER TABLE hanya support ADD COLUMN tanpa NOT NULL constraint.
+            // Backfill dijalankan terpisah agar data lama yang printed=1 ikut diset.
+            bool addedOdd = false, addedEven = false;
+
+            if (!TableHasColumn(con, "order_process", "printed_odd"))
+            {
+                using var cmd = con.CreateCommand();
+                cmd.CommandText = "ALTER TABLE order_process ADD COLUMN printed_odd INTEGER DEFAULT 0;";
+                cmd.ExecuteNonQuery();
+                addedOdd = true;
+            }
+
+            if (!TableHasColumn(con, "order_process", "printed_even"))
+            {
+                using var cmd = con.CreateCommand();
+                cmd.CommandText = "ALTER TABLE order_process ADD COLUMN printed_even INTEGER DEFAULT 0;";
+                cmd.ExecuteNonQuery();
+                addedEven = true;
+            }
+
+            // Backfill hanya kalau ada kolom baru yang baru saja ditambahkan
+            if (addedOdd || addedEven)
+            {
+                using var cmdBackfill = con.CreateCommand();
+                cmdBackfill.CommandText =
+                    """
+                    UPDATE order_process
+                    SET printed_odd  = CASE WHEN printed = 1 THEN 1 ELSE 0 END,
+                        printed_even = CASE WHEN printed = 1 THEN 1 ELSE 0 END
+                    WHERE printed = 1;
+                    """;
+                cmdBackfill.ExecuteNonQuery();
+            }
+        }
 
         private void DbSetPrinted(string orderSn, string itemKey, bool printed)
         {
@@ -1206,6 +2772,8 @@ private void InitDatabase()
             cmd.CommandText = @"
 UPDATE order_process
 SET printed = $p,
+    printed_odd = CASE WHEN $p=1 THEN 1 ELSE 0 END,
+    printed_even = CASE WHEN $p=1 THEN 1 ELSE 0 END,
     printed_at = CASE WHEN $p=1 THEN $t ELSE NULL END
 WHERE order_sn = $sn AND item_key = $k;
 ";
@@ -1226,6 +2794,8 @@ WHERE order_sn = $sn AND item_key = $k;
             cmd.CommandText = @"
 UPDATE order_process
 SET printed = $p,
+    printed_odd = CASE WHEN $p=1 THEN 1 ELSE 0 END,
+    printed_even = CASE WHEN $p=1 THEN 1 ELSE 0 END,
     printed_at = CASE WHEN $p=1 THEN $t ELSE NULL END
 WHERE id = $id;
 ";
@@ -1233,6 +2803,30 @@ WHERE id = $id;
             cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
             cmd.Parameters.AddWithValue("$id", id);
             return cmd.ExecuteNonQuery();
+        }
+
+        private void DbSetPrintedSidesById(long id, bool printedOdd, bool printedEven)
+        {
+            if (id <= 0) return;
+            using var con = OpenDb();
+            con.Open();
+
+            var isPrinted = printedOdd && printedEven;
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = @"
+UPDATE order_process
+SET printed_odd = $odd,
+    printed_even = $even,
+    printed = $printed,
+    printed_at = CASE WHEN $printed=1 THEN $t ELSE NULL END
+WHERE id = $id;
+";
+            cmd.Parameters.AddWithValue("$odd", printedOdd ? 1 : 0);
+            cmd.Parameters.AddWithValue("$even", printedEven ? 1 : 0);
+            cmd.Parameters.AddWithValue("$printed", isPrinted ? 1 : 0);
+            cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.ExecuteNonQuery();
         }
 
         private string? GetState(string key)
@@ -1541,61 +3135,143 @@ private static string? TryFormatShopeeResultListFailures(JsonElement root)
             return m.IndexOf("shipping_document_should_print_first", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
-private async Task<List<string>> GetOrderSnsByStatusAsync(
-    string status,
-    long timeFrom,
-    long timeTo,
-    IProgress<SyncProgress> progress,
-    CancellationToken ct)
-{
-    var path = "/api/v2/order/get_order_list";
-    var query = new Dictionary<string, string>
-    {
-        ["time_range_field"] = "update_time",
-        ["time_from"] = timeFrom.ToString(CultureInfo.InvariantCulture),
-        ["time_to"] = timeTo.ToString(CultureInfo.InvariantCulture),
-        ["page_size"] = "50",
-        ["order_status"] = status
-    };
-
-    var all = new List<string>();
-    string? cursor = null;
-
-    do
-    {
-        if (!string.IsNullOrWhiteSpace(cursor))
-            query["cursor"] = cursor;
-
-        var doc = await GetShopApiWithLogAsync(path, query, progress, ct);
-        EnsureShopeeOkOrThrow(doc.RootElement);
-
-        cursor = null;
-
-        if (doc.RootElement.TryGetProperty("response", out var resp))
+        /// <summary>
+        /// Untuk satu halaman order_sn dari API, kembalikan SN yang belum ada di DB dan penanda apakah ada SN existing.
+        /// Dipakai khusus alur CANCELLED agar hanya SN baru yang diproses detail.
+        /// </summary>
+        private (List<string> Missing, bool HasExisting) SplitOrderSnsByDbPresence(IReadOnlyList<string> pageOrderSns)
         {
-            if (resp.TryGetProperty("order_list", out var list) && list.ValueKind == JsonValueKind.Array)
+            var distinct = pageOrderSns
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (distinct.Count == 0)
+                return (new List<string>(), false);
+
+            try
             {
-                foreach (var item in list.EnumerateArray())
+                using var con = OpenDb();
+                con.Open();
+                using var cmd = con.CreateCommand();
+                var names = Enumerable.Range(0, distinct.Count).Select(i => "$p" + i).ToArray();
+                cmd.CommandText =
+                    $"SELECT DISTINCT order_sn FROM order_process WHERE order_sn IN ({string.Join(",", names)});";
+                for (var i = 0; i < distinct.Count; i++)
+                    cmd.Parameters.AddWithValue(names[i], distinct[i]);
+
+                var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                using (var rd = cmd.ExecuteReader())
                 {
-                    if (item.TryGetProperty("order_sn", out var sn))
+                    while (rd.Read())
                     {
-                        var s = sn.GetString();
-                        if (!string.IsNullOrWhiteSpace(s)) all.Add(s);
+                        if (rd.IsDBNull(0)) continue;
+                        var sn = rd.GetString(0);
+                        if (!string.IsNullOrWhiteSpace(sn))
+                            existing.Add(sn);
                     }
                 }
-            }
 
-            var more = resp.TryGetProperty("more", out var mo) && mo.ValueKind == JsonValueKind.True;
-            var nextCursor = resp.TryGetProperty("next_cursor", out var nc) ? nc.GetString() : null;
-            cursor = (more && !string.IsNullOrWhiteSpace(nextCursor)) ? nextCursor : null;
+                var missing = distinct.Where(sn => !existing.Contains(sn)).ToList();
+                return (missing, existing.Count > 0);
+            }
+            catch
+            {
+                return (distinct, false);
+            }
         }
 
-        await Task.Delay(200, ct);
-    }
-    while (!string.IsNullOrWhiteSpace(cursor));
+        private async Task<List<string>> GetOrderSnsByStatusAsync(
+            string status,
+            long timeFrom,
+            long timeTo,
+            IProgress<SyncProgress> progress,
+            CancellationToken ct)
+        {
+            var path = "/api/v2/order/get_order_list";
+            var query = new Dictionary<string, string>
+            {
+                ["time_range_field"] = "update_time",
+                ["time_from"] = timeFrom.ToString(CultureInfo.InvariantCulture),
+                ["time_to"] = timeTo.ToString(CultureInfo.InvariantCulture),
+                ["page_size"] = "50",
+                ["order_status"] = status
+            };
 
-    return all;
-}
+            var all = new List<string>();
+            string? cursor = null;
+            const int maxCancelledListPages = 30;
+            var cancelledListPages = 0;
+
+            do
+            {
+                if (!string.IsNullOrWhiteSpace(cursor))
+                    query["cursor"] = cursor;
+
+                var doc = await GetShopApiWithLogAsync(path, query, progress, ct);
+                EnsureShopeeOkOrThrow(doc.RootElement);
+
+                cursor = null;
+
+                var pageSns = new List<string>();
+
+                if (doc.RootElement.TryGetProperty("response", out var resp))
+                {
+                    if (resp.TryGetProperty("order_list", out var list) && list.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var item in list.EnumerateArray())
+                        {
+                            if (item.TryGetProperty("order_sn", out var sn))
+                            {
+                                var s = sn.GetString();
+                                if (!string.IsNullOrWhiteSpace(s))
+                                    pageSns.Add(s);
+                            }
+                        }
+                    }
+
+                    var more = resp.TryGetProperty("more", out var mo) && mo.ValueKind == JsonValueKind.True;
+                    var nextCursor = resp.TryGetProperty("next_cursor", out var nc) ? nc.GetString() : null;
+                    cursor = (more && !string.IsNullOrWhiteSpace(nextCursor)) ? nextCursor : null;
+
+                    // Hanya untuk CANCELLED: ambil SN yang belum ada di DB saja, dan hentikan paginasi jika
+                    // halaman ini sudah menyentuh data existing.
+                    if (string.Equals(status, "CANCELLED", StringComparison.OrdinalIgnoreCase))
+                    {
+                        cancelledListPages++;
+                        var split = SplitOrderSnsByDbPresence(pageSns);
+                        all.AddRange(split.Missing);
+
+                        if (split.HasExisting)
+                        {
+                            progress.Report(new SyncProgress
+                            {
+                                Log =
+                                    "[order_list CANCELLED] Stop pagination: ketemu order existing di DB; hanya SN baru yang diproses."
+                            });
+                            cursor = null;
+                        }
+                        else if (cancelledListPages >= maxCancelledListPages)
+                        {
+                            progress.Report(new SyncProgress
+                            {
+                                Log =
+                                    $"[order_list CANCELLED] Stop pagination: batas {maxCancelledListPages} halaman (tidak menarik seluruh riwayat)."
+                            });
+                            cursor = null;
+                        }
+                    }
+                    else
+                    {
+                        all.AddRange(pageSns);
+                    }
+                }
+
+                await Task.Delay(200, ct);
+            }
+            while (!string.IsNullOrWhiteSpace(cursor));
+
+            return all;
+        }
 
 private async Task<List<JsonElement>> GetOrderDetailBatchRawAsync(
     List<string> orderSnList,
@@ -1645,7 +3321,7 @@ ON CONFLICT(order_sn) DO UPDATE SET
     cmd.ExecuteNonQuery();
 }
 
-private void InsertOrderProcess(string orderSn, string itemKey, string modelSku, string itemSku,
+private void InsertOrderProcess(string orderSn, string orderItemId, string itemKey, string modelSku, string itemSku,
     string itemName, string modelName, int qty, string status, long createTime)
 {
     using var con = OpenDb();
@@ -1653,9 +3329,12 @@ private void InsertOrderProcess(string orderSn, string itemKey, string modelSku,
 
     using var cmd = con.CreateCommand();
     cmd.CommandText = @"
-INSERT INTO order_process(order_sn,item_key,model_sku,item_sku,item_name,model_name,qty,status,create_time,saved_at)
-VALUES($sn,$k,$ms,$is,$in,$mn,$q,$st,$ct,$sa)
-ON CONFLICT(order_sn, item_key) DO UPDATE SET
+INSERT INTO order_process(order_sn,order_item_id,item_key,model_sku,item_sku,item_name,model_name,qty,status,create_time,saved_at)
+VALUES($sn,$oid,$k,$ms,$is,$in,$mn,$q,$st,$ct,$sa)
+ON CONFLICT(order_sn, order_item_id) DO UPDATE SET
+    item_key=excluded.item_key,
+    model_sku=excluded.model_sku,
+    item_sku=excluded.item_sku,
     status=excluded.status,
     qty=excluded.qty,
     saved_at=excluded.saved_at,
@@ -1663,6 +3342,7 @@ ON CONFLICT(order_sn, item_key) DO UPDATE SET
     model_name=excluded.model_name;
 ";
     cmd.Parameters.AddWithValue("$sn", orderSn);
+    cmd.Parameters.AddWithValue("$oid", orderItemId ?? "");
     cmd.Parameters.AddWithValue("$k", itemKey);
     cmd.Parameters.AddWithValue("$ms", modelSku ?? "");
     cmd.Parameters.AddWithValue("$is", itemSku ?? "");
@@ -1675,6 +3355,109 @@ ON CONFLICT(order_sn, item_key) DO UPDATE SET
     cmd.ExecuteNonQuery();
 }
 
+        private void UpsertOrderProcessFromOrderJson(JsonElement order)
+        {
+            var orderSn = order.TryGetProperty("order_sn", out var sn) ? sn.GetString() : "";
+            if (string.IsNullOrWhiteSpace(orderSn)) return;
+
+            var status = order.TryGetProperty("order_status", out var st) ? st.GetString() ?? "" : "";
+            var createTime = order.TryGetProperty("create_time", out var ct) ? ct.GetInt64() : 0;
+
+            if (!order.TryGetProperty("item_list", out var il) || il.ValueKind != JsonValueKind.Array)
+                return;
+
+            var lineIds = new List<string>();
+            var lineIndex = 0;
+            foreach (var it in il.EnumerateArray())
+            {
+                var itemSku = it.TryGetProperty("item_sku", out var isku) ? isku.GetString() ?? "" : "";
+                var modelSku = GetShopeeModelSku(it);
+                var itemName = it.TryGetProperty("item_name", out var iname) ? iname.GetString() ?? "" : "";
+                var modelName = it.TryGetProperty("model_name", out var mname) ? mname.GetString() ?? "" : "";
+                var qty = it.TryGetProperty("model_quantity_purchased", out var q) ? q.GetInt32() : 1;
+
+                var orderItemId = GetShopeeOrderLineId(it, lineIndex);
+                lineIndex++;
+                lineIds.Add(orderItemId);
+
+                var itemKey = KeyModelItem(modelSku, itemSku);
+                InsertOrderProcess(orderSn, orderItemId, itemKey, modelSku, itemSku, itemName, modelName, qty, status, createTime);
+            }
+
+            if (lineIds.Count > 0)
+                DeleteOrderProcessLinesNotIn(orderSn, lineIds);
+        }
+
+        /// <summary>Perbaiki baris order dari <c>orders.raw_json</c> (mis. varian sama SKU beda model_id).</summary>
+        private void RebuildAllOrderProcessLinesFromRawJson()
+        {
+            Paperbell_App.App.Trace("Rebuild: check gate");
+            if (GetState("order_line_id_rebuild_v1") == "1")
+            {
+                Paperbell_App.App.Trace("Rebuild: already done, skip");
+                return;
+            }
+
+            Paperbell_App.App.Trace("Rebuild: collect raw_json rows");
+
+            // Materialize semua baris dulu supaya reader/connection tertutup
+            // sebelum kita melakukan write per-baris (mencegah SQLite lock contention).
+            var rawRows = new List<string>();
+            using (var con = OpenDb())
+            {
+                con.Open();
+                using var cmd = con.CreateCommand();
+                cmd.CommandText = "SELECT raw_json FROM orders WHERE raw_json IS NOT NULL AND raw_json <> '';";
+                using var rd = cmd.ExecuteReader();
+                while (rd.Read())
+                {
+                    var raw = rd.IsDBNull(0) ? "" : rd.GetString(0);
+                    if (!string.IsNullOrWhiteSpace(raw))
+                        rawRows.Add(raw);
+                }
+            }
+
+            Paperbell_App.App.Trace($"Rebuild: process {rawRows.Count} rows");
+
+            foreach (var raw in rawRows)
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(raw);
+                    UpsertOrderProcessFromOrderJson(doc.RootElement);
+                }
+                catch
+                {
+                    // skip corrupt rows
+                }
+            }
+
+            Paperbell_App.App.Trace("Rebuild: SetState gate=1");
+            SetState("order_line_id_rebuild_v1", "1");
+            Paperbell_App.App.Trace("Rebuild: done");
+        }
+
+        private void DeleteOrderProcessLinesNotIn(string orderSn, IReadOnlyList<string> keepLineIds)
+        {
+            if (string.IsNullOrWhiteSpace(orderSn) || keepLineIds == null || keepLineIds.Count == 0)
+                return;
+
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            var placeholders = new List<string>();
+            for (int i = 0; i < keepLineIds.Count; i++)
+            {
+                var p = "$id" + i;
+                placeholders.Add(p);
+                cmd.Parameters.AddWithValue(p, keepLineIds[i] ?? "");
+            }
+            cmd.Parameters.AddWithValue("$sn", orderSn);
+            cmd.CommandText =
+                $"DELETE FROM order_process WHERE order_sn = $sn AND order_item_id NOT IN ({string.Join(",", placeholders)});";
+            cmd.ExecuteNonQuery();
+        }
+
         private void LoadShopeeFromDbToUi(int lastDays = 8)
         {
             // ambil data terbaru N hari dari DB
@@ -1684,20 +3467,19 @@ ON CONFLICT(order_sn, item_key) DO UPDATE SET
             con.Open();
 
             using var cmd = con.CreateCommand();
-            cmd.CommandText = @"
-SELECT id, order_sn, item_key, model_sku, item_sku, item_name, model_name, qty, status, create_time, printed
+            cmd.CommandText = $@"
+SELECT id, order_sn, item_key, model_sku, item_sku, item_name, model_name, qty, status, create_time, printed, printed_odd, printed_even
 FROM order_process
-WHERE create_time >= $from
+WHERE create_time >= $from AND {SqlOrderNotCancelled}
 ORDER BY create_time DESC;
 ";
             cmd.Parameters.AddWithValue("$from", fromUnix);
 
             using var rd = cmd.ExecuteReader();
 
-            // optional: biar gak dobel kalau Rows sudah ada isi
-            var existing = new HashSet<string>(
-                Rows.Select(r => $"{r.OrderNo}|{r.VariationCode}"),
-                StringComparer.OrdinalIgnoreCase);
+            // optional: biar gak dobel kalau Rows sudah ada isi (per baris DB, bukan per SKU)
+            var existing = new HashSet<long>(
+                Rows.Where(r => r.OrderProcessId > 0).Select(r => r.OrderProcessId));
 
             int added = 0;
 
@@ -1714,10 +3496,10 @@ ORDER BY create_time DESC;
                 var status = rd.GetString(8);
                 var createT = rd.GetInt64(9);
                 var printed = !rd.IsDBNull(10) && rd.GetInt32(10) == 1;
+                var printedOdd = !rd.IsDBNull(11) && rd.GetInt32(11) == 1;
+                var printedEven = !rd.IsDBNull(12) && rd.GetInt32(12) == 1;
 
-                // dedup UI
-                var sig = $"{orderSn}|{itemKey}";
-                if (existing.Contains(sig)) continue;
+                if (existing.Contains(id)) continue;
 
                 _dataMap.TryGetValue(itemKey, out var map);
 
@@ -1767,10 +3549,17 @@ ORDER BY create_time DESC;
                     };
                 }
 
-                                    row.IsPrinted = printed;
-                    row.CanTogglePrinted = row.OrderProcessId > 0;
-                    Rows.Add(row);
-                existing.Add(sig);
+                row.OrderItemQty = Math.Max(0, qty);
+                _inventoryQty.TryGetValue(itemKey, out var invStkUi);
+                row.InventoryAvailableQty = invStkUi;
+
+                row.IsPrinted = printed;
+                row.PrintedOddSide = printedOdd;
+                row.PrintedEvenSide = printedEven;
+                row.ShopeeOrderStatus = status;
+                row.CanTogglePrinted = row.OrderProcessId > 0 && !row.IsShopeeOrderCancelled;
+                Rows.Add(row);
+                existing.Add(id);
                 added++;
             }
 
@@ -1958,8 +3747,9 @@ ORDER BY create_time DESC;
                     progress.Report(new SyncProgress { Percent = 1, Label = "Starting...", Log = "Starting sync..." });
 
                     var timeTo = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                    var timeFrom = DateTimeOffset.UtcNow.AddDays(-1).ToUnixTimeSeconds();
-                    var statuses = new[] { "PROCESSED", "READY_TO_SHIP" };
+                    // Rentang lebih lebar: pembatalan pakai update_time; 1 hari sering melewatkan order yang statusnya berubah.
+                    var timeFrom = DateTimeOffset.UtcNow.AddDays(-7).ToUnixTimeSeconds();
+                    var statuses = new[] { "PROCESSED", "READY_TO_SHIP", "IN_CANCEL", "CANCELLED" };
 
                     var allSns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     foreach (var st in statuses)
@@ -1996,21 +3786,7 @@ ORDER BY create_time DESC;
                             var updateTime = o.TryGetProperty("update_time", out var ut) ? ut.GetInt64() : 0;
 
                             UpsertOrderRaw(orderSn, status, createTime, updateTime, o.GetRawText());
-
-                            if (o.TryGetProperty("item_list", out var il) && il.ValueKind == JsonValueKind.Array)
-                            {
-                                foreach (var it in il.EnumerateArray())
-                                {
-                                    var itemSku = it.TryGetProperty("item_sku", out var isku) ? isku.GetString() ?? "" : "";
-                                    var modelSku = it.TryGetProperty("model_sku", out var msku) ? msku.GetString() ?? "" : "";
-                                    var itemName = it.TryGetProperty("item_name", out var iname) ? iname.GetString() ?? "" : "";
-                                    var modelName = it.TryGetProperty("model_name", out var mname) ? mname.GetString() ?? "" : "";
-                                    var qty = it.TryGetProperty("model_quantity_purchased", out var q) ? q.GetInt32() : 1;
-
-                                    var itemKey = KeyModelItem(modelSku, itemSku);
-                                    InsertOrderProcess(orderSn, itemKey, modelSku, itemSku, itemName, modelName, qty, status, createTime);
-                                }
-                            }
+                            UpsertOrderProcessFromOrderJson(o);
                         }
 
                         await Task.Delay(50, cts.Token);
@@ -2042,6 +3818,13 @@ ORDER BY create_time DESC;
 
         private void Window_KeyDown(object sender, KeyEventArgs e)
         {
+            if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control && e.Key == Key.W)
+            {
+                Close();
+                e.Handled = true;
+                return;
+            }
+
             // Jangan ganggu kalau user lagi ngetik di TextBox / ComboBox
             if (Keyboard.FocusedElement is TextBox ||
                 Keyboard.FocusedElement is ComboBox)
@@ -3215,11 +4998,19 @@ ON CONFLICT(order_sn) DO UPDATE SET
             var where = "o.create_time >= $from ";
             switch (_resiTabFilter)
             {
+                case ResiTabFilter.All:
+                    where += "AND IFNULL(UPPER(TRIM(o.status)), '') <> 'CANCELLED' ";
+                    break;
                 case ResiTabFilter.NotPrintedResi:
-                    where += "AND (COALESCE(r.resi_printed,0) = 0) ";
+                    where += "AND IFNULL(UPPER(TRIM(o.status)), '') <> 'CANCELLED' " +
+                             "AND (COALESCE(r.resi_printed,0) = 0) ";
                     break;
                 case ResiTabFilter.PrintedResi:
-                    where += "AND COALESCE(r.resi_printed,0) = 1 ";
+                    where += "AND IFNULL(UPPER(TRIM(o.status)), '') <> 'CANCELLED' " +
+                             "AND COALESCE(r.resi_printed,0) = 1 ";
+                    break;
+                case ResiTabFilter.CancelledResi:
+                    where += "AND IFNULL(UPPER(TRIM(o.status)), '') = 'CANCELLED' ";
                     break;
             }
 
@@ -3250,6 +5041,9 @@ WHERE {where};";
                 case ResiTabFilter.PrintedResi:
                     _resiPageIndexPrinted = _resiPageIndex;
                     break;
+                case ResiTabFilter.CancelledResi:
+                    _resiPageIndexCancelled = _resiPageIndex;
+                    break;
             }
 
             var fromUnix = DateTimeOffset.UtcNow.AddDays(-ResiListDaysBack).ToUnixTimeSeconds();
@@ -3258,11 +5052,19 @@ WHERE {where};";
             var where = "o.create_time >= $from ";
             switch (_resiTabFilter)
             {
+                case ResiTabFilter.All:
+                    where += "AND IFNULL(UPPER(TRIM(o.status)), '') <> 'CANCELLED' ";
+                    break;
                 case ResiTabFilter.NotPrintedResi:
-                    where += "AND (COALESCE(r.resi_printed,0) = 0) ";
+                    where += "AND IFNULL(UPPER(TRIM(o.status)), '') <> 'CANCELLED' " +
+                             "AND (COALESCE(r.resi_printed,0) = 0) ";
                     break;
                 case ResiTabFilter.PrintedResi:
-                    where += "AND COALESCE(r.resi_printed,0) = 1 ";
+                    where += "AND IFNULL(UPPER(TRIM(o.status)), '') <> 'CANCELLED' " +
+                             "AND COALESCE(r.resi_printed,0) = 1 ";
+                    break;
+                case ResiTabFilter.CancelledResi:
+                    where += "AND IFNULL(UPPER(TRIM(o.status)), '') = 'CANCELLED' ";
                     break;
             }
 
@@ -3270,7 +5072,7 @@ WHERE {where};";
             using var con = OpenDb();
             con.Open();
             using var cmd = con.CreateCommand();
-            cmd.CommandText = $@"SELECT o.order_sn, o.create_time, r.pdf_path, COALESCE(r.resi_printed,0)
+            cmd.CommandText = $@"SELECT o.order_sn, o.create_time, r.pdf_path, COALESCE(r.resi_printed,0), o.status, o.raw_json
 FROM orders o
 LEFT JOIN order_resi r ON r.order_sn = o.order_sn
 WHERE {where}
@@ -3280,23 +5082,39 @@ LIMIT $take OFFSET $skip;";
             cmd.Parameters.AddWithValue("$take", ResiPageSize);
             cmd.Parameters.AddWithValue("$skip", skip);
 
+            var loadedSns = new List<string>();
             using var rd = cmd.ExecuteReader();
             while (rd.Read())
             {
                 var sn = rd.GetString(0);
+                loadedSns.Add(sn);
                 var ct = rd.IsDBNull(1) ? 0 : rd.GetInt64(1);
                 var pdf = rd.IsDBNull(2) ? null : rd.GetString(2);
                 var rp = rd.IsDBNull(3) ? 0 : rd.GetInt32(3);
+                var status = rd.IsDBNull(4) ? "" : rd.GetString(4);
+                var rawJson = rd.IsDBNull(5) ? "" : rd.GetString(5);
                 ResiRows.Add(new ResiRow
                 {
                     OrderSn = sn,
                     CreateTimeUnix = ct,
                     PdfPath = string.IsNullOrWhiteSpace(pdf) ? null : pdf,
-                    ResiPrinted = rp == 1
+                    ResiPrinted = rp == 1,
+                    ShopeeOrderStatus = status,
+                    NotesText = ExtractOrderNotesText(rawJson)
                 });
             }
 
+            var productProgress = LoadProductPrintProgressForResiBatch(loadedSns);
+            foreach (var row in ResiRows)
+            {
+                if (productProgress.TryGetValue(row.OrderSn, out var prog))
+                    row.ApplyProductPrintProgress(prog.NotPrinted, prog.Total);
+                else
+                    row.ApplyProductPrintProgress(0, 0);
+            }
+
             UpdateResiPagingUi();
+            UpdateOrderFulfillmentSummaryUi();
         }
 
         private void UpdateResiPagingUi()
@@ -3406,7 +5224,7 @@ LIMIT $take OFFSET $skip;";
             var idx = ResiFilterTabs.SelectedIndex;
             if (idx < 0)
                 return;
-            var hosts = new[] { ResiGridHost0, ResiGridHost1, ResiGridHost2 };
+            var hosts = new[] { ResiGridHost0, ResiGridHost1, ResiGridHost2, ResiGridHost3 };
             if (idx >= hosts.Length || hosts[idx] == null)
                 return;
             var target = hosts[idx];
@@ -3440,6 +5258,9 @@ LIMIT $take OFFSET $skip;";
                 case ResiTabFilter.PrintedResi:
                     _resiPageIndexPrinted = _resiPageIndex;
                     break;
+                case ResiTabFilter.CancelledResi:
+                    _resiPageIndexCancelled = _resiPageIndex;
+                    break;
             }
 
             switch (ResiFilterTabs.SelectedIndex)
@@ -3449,13 +5270,20 @@ LIMIT $take OFFSET $skip;";
                     _resiPageIndex = _resiPageIndexAll;
                     break;
                 case 1:
-                default:
                     _resiTabFilter = ResiTabFilter.NotPrintedResi;
                     _resiPageIndex = _resiPageIndexNotPrinted;
                     break;
                 case 2:
                     _resiTabFilter = ResiTabFilter.PrintedResi;
                     _resiPageIndex = _resiPageIndexPrinted;
+                    break;
+                case 3:
+                    _resiTabFilter = ResiTabFilter.CancelledResi;
+                    _resiPageIndex = _resiPageIndexCancelled;
+                    break;
+                default:
+                    _resiTabFilter = ResiTabFilter.NotPrintedResi;
+                    _resiPageIndex = _resiPageIndexNotPrinted;
                     break;
             }
 
@@ -3483,7 +5311,12 @@ LIMIT $take OFFSET $skip;";
         }
 
         private List<ResiRow> GetResiRowsTargetedForPdfFetch() =>
-            ResiGrid.SelectedItems.Cast<ResiRow>().GroupBy(r => r.OrderSn).Select(g => g.First()).ToList();
+            ResiGrid.SelectedItems
+                .Cast<ResiRow>()
+                .Where(r => r.CanProcessLabel)
+                .GroupBy(r => r.OrderSn)
+                .Select(g => g.First())
+                .ToList();
 
         private void ResiBulkFetchUi(Action action)
         {
@@ -3568,6 +5401,8 @@ LIMIT $take OFFSET $skip;";
         private async void ResiRowFetch_Click(object sender, RoutedEventArgs e)
         {
             if ((sender as FrameworkElement)?.DataContext is not ResiRow row)
+                return;
+            if (!row.CanProcessLabel)
                 return;
             await FetchResiForRowAsync(row, showSuccessDialog: true);
         }
@@ -3768,6 +5603,8 @@ LIMIT $take OFFSET $skip;";
         {
             if ((sender as FrameworkElement)?.DataContext is not ResiRow row)
                 return;
+            if (!row.CanProcessLabel)
+                return;
             await PrintResiRowAsync(row);
         }
 
@@ -3797,13 +5634,15 @@ LIMIT $take OFFSET $skip;";
                 PdfPrintScale = pdfPrintScale
             };
 
-            await PrintAsync(temp, markShopeeLineAsPrinted: false);
+            await PrintAsync(temp, markShopeeLineAsPrinted: false, applyProductPrinterOverride: false);
             var ok = string.Equals(temp.Status, "Done", StringComparison.OrdinalIgnoreCase);
             if (ok)
             {
                 DbSetResiPrinted(row.OrderSn, true);
                 if (reloadPage)
                     LoadResiPageFromDb(_resiPageIndex);
+                if (Rows.Count > 0)
+                    RefreshOrderFulfillmentOnRows();
             }
 
             return (ok, ok ? null : (temp.Status ?? "Gagal cetak"));
@@ -3926,8 +5765,12 @@ LIMIT $take OFFSET $skip;";
         {
             if ((sender as FrameworkElement)?.DataContext is not ResiRow row)
                 return;
+            if (!row.CanProcessLabel)
+                return;
             DbSetResiPrinted(row.OrderSn, !row.ResiPrinted);
             LoadResiPageFromDb(_resiPageIndex);
+            if (Rows.Count > 0)
+                RefreshOrderFulfillmentOnRows();
         }
 
         
@@ -4270,6 +6113,58 @@ private static string NormKey(string? s)
 
 private static string KeyModelItem(string? modelSku, string? itemSku)
     => NormKey(modelSku) + NormKey(itemSku);
+
+        private static string GetShopeeModelSku(JsonElement it)
+        {
+            if (it.TryGetProperty("model_sku", out var msku))
+            {
+                var s = msku.GetString();
+                if (!string.IsNullOrWhiteSpace(s)) return s.Trim();
+            }
+            if (it.TryGetProperty("variation_sku", out var vsku))
+            {
+                var s = vsku.GetString();
+                if (!string.IsNullOrWhiteSpace(s)) return s.Trim();
+            }
+            return "";
+        }
+
+        /// <summary>
+        /// ID unik per baris item di order Shopee.
+        /// Shopee sering mengisi <c>order_item_id</c> sama dengan <c>item_id</c> untuk semua varian;
+        /// varian dibedakan oleh <c>model_id</c> (dan nama varian), bukan SKU induk.
+        /// </summary>
+        private static string GetShopeeOrderLineId(JsonElement it, int fallbackIndex)
+        {
+            long itemId = 0, modelId = 0;
+            if (it.TryGetProperty("item_id", out var iid) && iid.ValueKind == JsonValueKind.Number)
+                itemId = iid.GetInt64();
+            if (it.TryGetProperty("model_id", out var mid) && mid.ValueKind == JsonValueKind.Number)
+                modelId = mid.GetInt64();
+
+            if (modelId != 0)
+                return $"{itemId}:{modelId}";
+
+            long orderItemId = 0;
+            if (it.TryGetProperty("order_item_id", out var oid) && oid.ValueKind == JsonValueKind.Number)
+                orderItemId = oid.GetInt64();
+            else if (it.TryGetProperty("order_item_id", out oid) && oid.ValueKind == JsonValueKind.String)
+                long.TryParse(oid.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out orderItemId);
+
+            if (orderItemId != 0 && orderItemId != itemId)
+                return orderItemId.ToString(CultureInfo.InvariantCulture);
+
+            if (orderItemId != 0)
+                return orderItemId.ToString(CultureInfo.InvariantCulture);
+
+            var modelName = it.TryGetProperty("model_name", out var mn) ? mn.GetString() : null;
+            if (string.IsNullOrWhiteSpace(modelName) && it.TryGetProperty("variation_name", out var vn))
+                modelName = vn.GetString();
+            if (itemId != 0 && !string.IsNullOrWhiteSpace(modelName))
+                return $"{itemId}:n:{NormKey(modelName)}";
+
+            return $"line:{fallbackIndex}";
+        }
         private static string NormKeyPart(string? s) => (s ?? "").Trim();
 
         private static string KeySkuIndukRef(string skuInduk, string noRef)
@@ -4285,7 +6180,9 @@ private static string KeyModelItem(string? modelSku, string? itemSku)
             => $"R|{NormKeyPart(noRef)}";
 public MainWindow()
         {
+            Paperbell_App.App.Trace("MainWindow ctor: InitializeComponent");
             InitializeComponent();
+            Paperbell_App.App.Trace("MainWindow ctor: InitPdfPreviewAvailability");
             InitPdfPreviewAvailability();
 
             if (!_pdfPreviewAvailable)
@@ -4294,7 +6191,7 @@ public MainWindow()
                 HidePreviewLoading();
             }
 
-            // === FIX koneksi Shopee (pakai system proxy & credential) ===
+            Paperbell_App.App.Trace("MainWindow ctor: HttpClient setup");
             System.Net.ServicePointManager.SecurityProtocol =
                 SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
 
@@ -4319,17 +6216,43 @@ public MainWindow()
             PrintedView = new ListCollectionView(Rows);
             PrintedView.Filter = o => o is JobRow r && r.IsPrinted;
 
-
-
+            Paperbell_App.App.Trace("MainWindow ctor: setting DataContext");
             QueueGrid.ItemsSource = Rows;
+            if (PackGrid != null)
+                PackGrid.ItemsSource = PackRows;
             DataContext = this;
+            UpdateProductTabPanelsVisibility();
+            Paperbell_App.App.Trace("MainWindow ctor: RefreshPrinters");
             RefreshPrinters();
-            
-            EnsureDbDirectory();
-            SQLitePCL.Batteries.Init();
-            InitDatabase();
-            LoadAppStateFromDb();
-            UpdateShopeeUi();
+            Paperbell_App.App.Trace("MainWindow ctor: RefreshPrinters done");
+
+            try
+            {
+                Paperbell_App.App.Trace("MainWindow ctor: EnsureDbDirectory");
+                EnsureDbDirectory();
+                Paperbell_App.App.Trace("MainWindow ctor: SQLitePCL.Batteries.Init");
+                SQLitePCL.Batteries.Init();
+                Paperbell_App.App.Trace("MainWindow ctor: InitDatabase");
+                InitDatabase();
+                Paperbell_App.App.Trace("MainWindow ctor: LoadInventoryCacheFromDb");
+                LoadInventoryCacheFromDb();
+                Paperbell_App.App.Trace("MainWindow ctor: LoadAppStateFromDb");
+                LoadAppStateFromDb();
+                Paperbell_App.App.Trace("MainWindow ctor: UpdateShopeeUi");
+                UpdateShopeeUi();
+                Paperbell_App.App.Trace("MainWindow ctor: DB init OK");
+            }
+            catch (Exception ex)
+            {
+                Paperbell_App.App.Trace("MainWindow ctor DB EXCEPTION: " + ex);
+                MessageBox.Show(
+                    "Gagal inisialisasi database:\n" + ex,
+                    "Startup Error",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+                Application.Current.Shutdown();
+                return;
+            }
             // ✅ Ensure DataGrid edits are committed immediately (prevents printing old printer value)
             QueueGrid.CellEditEnding += (s3, e3) =>
             {
@@ -4361,16 +6284,6 @@ public MainWindow()
             // ✅ Autoload DataMap after window shown (avoid app exit if error)
             this.Loaded += (s, e) => TryAutoLoadDataMap();
 
-            // ✅ Prevent silent crash: show any unhandled UI exceptions
-            Application.Current.DispatcherUnhandledException += (s2, e2) =>
-            {
-                MessageBox.Show(
-                    "Unhandled error:" + e2.Exception,
-                    "Application Error",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Error);
-                e2.Handled = true;
-            };
         }
 
         private void RefreshViews()
@@ -4510,6 +6423,109 @@ public MainWindow()
 
         private void RefreshPrinters_Click(object sender, RoutedEventArgs e) => RefreshPrinters();
 
+        private void OverridePrinter_Click(object sender, RoutedEventArgs e)
+        {
+            if (Printers.Count == 0)
+            {
+                MessageBox.Show(
+                    "Daftar printer kosong. Klik Refresh Printers dulu.",
+                    "Override printer",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+                return;
+            }
+
+            var dialog = new Window
+            {
+                Owner = this,
+                Title = "Override printer",
+                Width = 460,
+                Height = 220,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                ResizeMode = ResizeMode.NoResize
+            };
+
+            var root = new Grid { Margin = new Thickness(14) };
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(160) });
+            root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var txtInfo = new TextBlock
+            {
+                Text = "Pilih printer override untuk default Brother dan L3210 di modul Cetak produk.\nPilih (auto) untuk kembali ke printer default masing-masing.",
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 0, 0, 10),
+                Foreground = System.Windows.Media.Brushes.DimGray
+            };
+            Grid.SetRow(txtInfo, 0);
+            Grid.SetColumnSpan(txtInfo, 2);
+            root.Children.Add(txtInfo);
+
+            var lblBrother = new TextBlock { Text = "Default Brother:", VerticalAlignment = System.Windows.VerticalAlignment.Center };
+            Grid.SetRow(lblBrother, 1);
+            Grid.SetColumn(lblBrother, 0);
+            root.Children.Add(lblBrother);
+
+            var cmbBrother = new ComboBox { Height = 28, VerticalContentAlignment = System.Windows.VerticalAlignment.Center };
+            cmbBrother.Items.Add(PrinterOverrideAuto);
+            foreach (var p in Printers) cmbBrother.Items.Add(p);
+            cmbBrother.SelectedItem = string.IsNullOrWhiteSpace(_overrideBrotherPrinter) ? PrinterOverrideAuto : _overrideBrotherPrinter;
+            Grid.SetRow(cmbBrother, 1);
+            Grid.SetColumn(cmbBrother, 1);
+            root.Children.Add(cmbBrother);
+
+            var lblL3210 = new TextBlock
+            {
+                Text = "Default L3210:",
+                VerticalAlignment = System.Windows.VerticalAlignment.Center,
+                Margin = new Thickness(0, 10, 0, 0)
+            };
+            Grid.SetRow(lblL3210, 2);
+            Grid.SetColumn(lblL3210, 0);
+            root.Children.Add(lblL3210);
+
+            var cmbL3210 = new ComboBox
+            {
+                Height = 28,
+                VerticalContentAlignment = System.Windows.VerticalAlignment.Center,
+                Margin = new Thickness(0, 10, 0, 0)
+            };
+            cmbL3210.Items.Add(PrinterOverrideAuto);
+            foreach (var p in Printers) cmbL3210.Items.Add(p);
+            cmbL3210.SelectedItem = string.IsNullOrWhiteSpace(_overrideL3210Printer) ? PrinterOverrideAuto : _overrideL3210Printer;
+            Grid.SetRow(cmbL3210, 2);
+            Grid.SetColumn(cmbL3210, 1);
+            root.Children.Add(cmbL3210);
+
+            var buttons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Right
+            };
+            var btnOk = new Button { Content = "OK", Width = 84, Margin = new Thickness(0, 0, 8, 0), IsDefault = true };
+            var btnCancel = new Button { Content = "Batal", Width = 84, IsCancel = true };
+            btnOk.Click += (_, _) => dialog.DialogResult = true;
+            buttons.Children.Add(btnOk);
+            buttons.Children.Add(btnCancel);
+            Grid.SetRow(buttons, 3);
+            Grid.SetColumnSpan(buttons, 2);
+            root.Children.Add(buttons);
+
+            dialog.Content = root;
+
+            if (dialog.ShowDialog() != true) return;
+
+            var bro = cmbBrother.SelectedItem as string;
+            var l32 = cmbL3210.SelectedItem as string;
+            _overrideBrotherPrinter = string.IsNullOrWhiteSpace(bro) || bro == PrinterOverrideAuto ? null : bro;
+            _overrideL3210Printer = string.IsNullOrWhiteSpace(l32) || l32 == PrinterOverrideAuto ? null : l32;
+            UpdateOverridePrinterStatusUi();
+            ApplyPrinterOverrideToProductRows();
+        }
+
         private void PickPdfs_Click(object sender, RoutedEventArgs e)
         {
             var dlg = new OpenFileDialog
@@ -4539,6 +6555,7 @@ public MainWindow()
                         TotalPages = 0
                     });
                 }
+                ApplyPrinterOverrideToProductRows();
             }
         }
 
@@ -4566,17 +6583,15 @@ public MainWindow()
                 return;
             }
 
-            var dlg = new RandomPagesWindow(planner, loose, sub => ResolvePrinterName(sub));
+            var dlg = new RandomPagesWindow(planner, loose, sub =>
+                ResolveProductPrinterWithOverride(sub));
             dlg.Owner = this;
-            if (dlg.ShowDialog() != true || dlg.GeneratedRows == null || dlg.GeneratedRows.Count == 0)
+            if (dlg.ShowDialog() != true || dlg.GeneratedRow == null)
                 return;
 
-            int idx = Rows.Count;
-            foreach (var row in dlg.GeneratedRows)
-            {
-                row.Index = ++idx;
-                Rows.Add(row);
-            }
+            dlg.GeneratedRow.Index = Rows.Count + 1;
+            Rows.Add(dlg.GeneratedRow);
+            ApplyPrinterOverrideToProductRows();
         }
 
         private (List<RandomPageMapPick> planner, List<RandomPageMapPick> loose) BuildRandomPagePicksFromDataMap()
@@ -4588,22 +6603,42 @@ public MainWindow()
 
             foreach (var m in _dataMap.Values)
             {
-                var path = (m.FilePath ?? "").Trim();
-                if (string.IsNullOrWhiteSpace(path)) continue;
+                var raw = (m.FilePath ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+
+                // Kumpulkan semua file PDF dari entry ini:
+                // - Kalau path adalah file langsung → 1 file
+                // - Kalau path adalah folder → semua *.pdf di folder tersebut (non-recursive)
+                var pdfFiles = new List<string>();
+                if (File.Exists(raw))
+                {
+                    pdfFiles.Add(raw);
+                }
+                else if (Directory.Exists(raw))
+                {
+                    pdfFiles.AddRange(
+                        Directory.GetFiles(raw, "*.pdf", SearchOption.TopDirectoryOnly)
+                                 .OrderBy(f => f, StringComparer.OrdinalIgnoreCase));
+                }
 
                 var kind = m.GroupKind;
-                if (kind == "P" && seenP.Add(path))
-                    planner.Add(new RandomPageMapPick
-                    {
-                        Display = BuildRandomPagePickLabel(m, path),
-                        PdfPath = path
-                    });
-                else if (kind == "L" && seenL.Add(path))
-                    loose.Add(new RandomPageMapPick
-                    {
-                        Display = BuildRandomPagePickLabel(m, path),
-                        PdfPath = path
-                    });
+                foreach (var path in pdfFiles)
+                {
+                    if (kind == "P" && seenP.Add(path))
+                        planner.Add(new RandomPageMapPick
+                        {
+                            Display = BuildRandomPagePickLabel(m, path),
+                            PdfPath = path,
+                            SearchText = BuildRandomPagePickSearchText(m, path)
+                        });
+                    else if (kind == "L" && seenL.Add(path))
+                        loose.Add(new RandomPageMapPick
+                        {
+                            Display = BuildRandomPagePickLabel(m, path),
+                            PdfPath = path,
+                            SearchText = BuildRandomPagePickSearchText(m, path)
+                        });
+                }
             }
 
             static string BuildRandomPagePickLabel(DataMapRow m, string path)
@@ -4614,6 +6649,18 @@ public MainWindow()
                 if (nr.Length > 0 && v.Length > 0) return $"{nr} / {v} — {fn}";
                 if (nr.Length > 0) return $"{nr} — {fn}";
                 return fn;
+            }
+
+            static string BuildRandomPagePickSearchText(DataMapRow m, string path)
+            {
+                return string.Join(" | ",
+                    new[]
+                    {
+                        (m.NoRef ?? "").Trim(),
+                        (m.Variasi ?? "").Trim(),
+                        (m.SKUInduk ?? "").Trim(),
+                        Path.GetFileName(path)
+                    }.Where(x => x.Length > 0));
             }
 
             return (planner, loose);
@@ -4968,7 +7015,10 @@ public MainWindow()
         private void RemoveRow_Click(object sender, RoutedEventArgs e)
         {
             if ((sender as FrameworkElement)?.DataContext is JobRow r)
+            {
+                TryDeleteTempMergedPdfIfNeeded(r);
                 Rows.Remove(r);
+            }
         }
 
         private async void PrintSelected_Click(object sender, RoutedEventArgs e)
@@ -4996,7 +7046,7 @@ public MainWindow()
                 _ => "simplex"
             };
 
-            // Default scaling: no scale (sesuai request)
+            // Actual size (tanpa fit / shrink).
             const string scaling = "noscale";
 
             // Paper: only include for standard sizes. For true custom like B5 JIS 192x257mm, use a dedicated printer profile in Windows.
@@ -5019,6 +7069,30 @@ public MainWindow()
             if (!string.IsNullOrWhiteSpace(copiesPart)) parts.Add(copiesPart);
 
             return string.Join(",", parts);
+        }
+
+        private static bool ShouldPrintPageForSide(int pageNumber, PrintSideMode side)
+        {
+            return side switch
+            {
+                PrintSideMode.Ganjil => (pageNumber % 2) == 1,
+                PrintSideMode.Genap => (pageNumber % 2) == 0,
+                _ => true
+            };
+        }
+
+        /// <summary>Range halaman untuk Sumatra: <c>5-6,odd</c> / <c>5-6,even</c> (bukan <c>/2</c>).</summary>
+        private static string BuildPageRangeForSelectedSide(JobRow r)
+        {
+            var from = Math.Max(1, r.PageFrom);
+            var to = r.PageTo <= 0 ? 0 : Math.Max(from, r.PageTo);
+
+            var baseRange = to <= 0 ? $"{from}-" : (from == to ? $"{from}" : $"{from}-{to}");
+            if (r.PrintSide == PrintSideMode.All)
+                return baseRange;
+
+            var sideFilter = r.PrintSide == PrintSideMode.Ganjil ? "odd" : "even";
+            return $"{baseRange},{sideFilter}";
         }
 
         private static void TryApplyJobRowPaperAndColor(PrintDocument pd, JobRow r)
@@ -5061,6 +7135,11 @@ public MainWindow()
             int pdfTotal = doc.PageCount;
             int from = Math.Max(1, r.PageFrom);
             int to = r.PageTo <= 0 ? pdfTotal : Math.Min(Math.Max(from, r.PageTo), pdfTotal);
+            var pageNumbers = Enumerable.Range(from, Math.Max(0, to - from + 1))
+                .Where(p => ShouldPrintPageForSide(p, r.PrintSide))
+                .ToList();
+            if (pageNumbers.Count == 0)
+                pageNumbers.Add(from);
 
             using var pd = new PrintDocument();
             pd.PrinterSettings.PrinterName = printerName;
@@ -5075,10 +7154,16 @@ public MainWindow()
             // Kurangi margin lunak Windows supaya (0,0) mendekati tepi kiri atas kertas/driver.
             pd.DefaultPageSettings.Margins = new Margins(0, 0, 0, 0);
 
-            var current = from;
+            var pageCursor = 0;
             pd.PrintPage += (_, e) =>
             {
-                int pageIndex = current - 1;
+                if (pageCursor < 0 || pageCursor >= pageNumbers.Count)
+                {
+                    e.HasMorePages = false;
+                    return;
+                }
+
+                int pageIndex = pageNumbers[pageCursor] - 1;
                 if (pageIndex < 0 || pageIndex >= doc.PageCount)
                 {
                     e.HasMorePages = false;
@@ -5126,8 +7211,8 @@ public MainWindow()
                 g.SmoothingMode = SmoothingMode.HighQuality;
                 g.DrawImage(bmp, x, y, drawWUnits, drawHUnits);
 
-                e.HasMorePages = current < to;
-                current++;
+                pageCursor++;
+                e.HasMorePages = pageCursor < pageNumbers.Count;
             };
 
             pd.Print();
@@ -5165,17 +7250,31 @@ public MainWindow()
     if (r.OrderProcessId <= 0)
     {
         r.IsPrinted = printed;
+        r.PrintedOddSide = printed;
+        r.PrintedEvenSide = printed;
         return;
     }
 
+    DbSetPrintedSidesById(r.OrderProcessId, printed, printed);
+    r.PrintedOddSide = printed;
+    r.PrintedEvenSide = printed;
     r.IsPrinted = printed;
-    DbSetPrintedById(r.OrderProcessId, printed);
+    RefreshOrderFulfillmentOnRows();
 }
 
 
 
-        private async Task PrintAsync(JobRow r, bool markShopeeLineAsPrinted = true)
+        private async Task PrintAsync(
+            JobRow r,
+            bool markShopeeLineAsPrinted = true,
+            bool applyProductPrinterOverride = true)
         {
+            if (r.IsShopeeOrderCancelled)
+            {
+                r.Status = "Order dibatalkan (Shopee)";
+                return;
+            }
+
             if (string.IsNullOrWhiteSpace(r.File) || !File.Exists(r.File))
             {
                 r.Status = "File missing";
@@ -5190,8 +7289,12 @@ public MainWindow()
 
             NormalizePageRangeForPrint(r);
 
-            // ✅ Validate/resolve printer name so Sumatra doesn't fall back to Windows default printer
-            var resolvedPrinter = ResolvePrinterName(r.Printer);
+            var trackSideProgress = r.PrintSide != PrintSideMode.All;
+
+            // Override printer hanya untuk modul Cetak produk.
+            var resolvedPrinter = applyProductPrinterOverride
+                ? ResolveProductPrinterWithOverride(r.Printer)
+                : ResolvePrinterName(r.Printer);
             if (string.IsNullOrWhiteSpace(resolvedPrinter))
             {
                 r.Status = "Selected printer not found on this PC";
@@ -5235,15 +7338,32 @@ public MainWindow()
             {
                 printTotalPages = Math.Max(1, effectiveTo - from + 1);
             }
+            if (trackSideProgress)
+            {
+                if (pdfTotal > 0)
+                {
+                    var boundedTo = effectiveTo <= 0 ? pdfTotal : Math.Min(effectiveTo, pdfTotal);
+                    var selectedPages = Enumerable.Range(from, Math.Max(0, boundedTo - from + 1))
+                        .Count(p => ShouldPrintPageForSide(p, r.PrintSide));
+                    printTotalPages = Math.Max(1, selectedPages);
+                }
+                else
+                {
+                    printTotalPages = Math.Max(1, (printTotalPages + 1) / 2);
+                }
+            }
 
             r.PrintTotalPages = printTotalPages;
             r.PrintedPages = 0;
 
-            if (markShopeeLineAsPrinted)
+            if (markShopeeLineAsPrinted && !trackSideProgress)
                 MarkPrintedInUiAndDb(r, true);
 
-            var usePdfiumGdi = _pdfPreviewAvailable &&
-                               (Math.Abs(r.PdfPrintScale - 1.0) > 0.0001 || r.PrintFromTopLeft);
+            // Ganjil/genap (duplex long edge) memakai Sumatra + noscale — sama dengan cetak All.
+            // Pdfium+GDI hanya untuk skala kustom atau posisi kiri-atas (label resi).
+            var usePdfiumGdi =
+                _pdfPreviewAvailable &&
+                (Math.Abs(r.PdfPrintScale - 1.0) > 0.0001 || r.PrintFromTopLeft);
             if (!usePdfiumGdi && Math.Abs(r.PdfPrintScale - 1.0) > 0.0001)
                 LogPrint($"PdfPrintScale={r.PdfPrintScale} diminta tapi PDF preview (Pdfium) mati — fallback Sumatra tanpa skala persen.");
             if (!usePdfiumGdi && r.PrintFromTopLeft)
@@ -5261,7 +7381,7 @@ public MainWindow()
 
                 try
                 {
-                    _ = MonitorPrintJobAsync(r, cts.Token);
+                    _ = MonitorPrintJobAsync(r, pname, cts.Token);
                     LogPrint($"PDFIUM GDI print scale={r.PdfPrintScale} topLeft={r.PrintFromTopLeft} printer='{pname}' file='{r.File}'");
 
                     await Task.Run(() => PrintPdfToPrinterWithScale(r, pname, r.PdfPrintScale), cts.Token);
@@ -5273,6 +7393,9 @@ public MainWindow()
                         await Task.Delay(400);
                         r.Percent = 100;
                         r.Status = "Done";
+                        if (markShopeeLineAsPrinted && trackSideProgress)
+                            MarkPrintedSideProgress(r);
+                        TryDeleteTempMergedPdfIfNeeded(r);
                     }
                 }
                 catch (OperationCanceledException)
@@ -5315,12 +7438,22 @@ public MainWindow()
             try
             {
                 // Kick off monitoring (best effort)
-                _ = MonitorPrintJobAsync(r, cts2.Token);
+                _ = MonitorPrintJobAsync(r, pname, cts2.Token);
 
                 // Print via SumatraPDF
                 await Task.Run(() =>
                 {
                     var printSettings = BuildSumatraPrintSettings(r);
+                    if (r.PrintSide != PrintSideMode.All)
+                    {
+                        var selectedRange = BuildPageRangeForSelectedSide(r);
+                        var settingsParts = printSettings.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                            .Select(p => p.Trim())
+                            .ToList();
+                        if (settingsParts.Count > 0)
+                            settingsParts[0] = selectedRange;
+                        printSettings = string.Join(",", settingsParts);
+                    }
                     var args = $"-print-to \"{pname}\" -print-settings \"{printSettings}\" -silent -exit-on-print \"{r.File}\"";
 
                     LogPrint($"ROW OrderNo='{r.OrderNo}' File='{r.File}' PickedPrinter='{r.Printer}' ResolvedPrinter='{pname}' Duplex='{r.Duplex}' Paper='{r.Paper}' Pages='{r.PageRange}' Copies='{r.Copies}'");
@@ -5371,6 +7504,9 @@ public MainWindow()
                     await Task.Delay(400);
                     r.Percent = 100;
                     r.Status = "Done";
+                    if (markShopeeLineAsPrinted && trackSideProgress)
+                        MarkPrintedSideProgress(r);
+                    TryDeleteTempMergedPdfIfNeeded(r);
                 }
             }
             catch (OperationCanceledException)
@@ -5389,6 +7525,73 @@ public MainWindow()
                 if (r.JobGuid != null) _jobCts.Remove(r.JobGuid.Value);
                 r.JobGuid = null;
             }
+        }
+
+        private void MarkPrintedSideProgress(JobRow r)
+        {
+            if (r == null) return;
+
+            var printedOdd = r.PrintedOddSide;
+            var printedEven = r.PrintedEvenSide;
+
+            switch (r.PrintSide)
+            {
+                case PrintSideMode.Ganjil:
+                    printedOdd = true;
+                    break;
+                case PrintSideMode.Genap:
+                    printedEven = true;
+                    break;
+                default:
+                    printedOdd = true;
+                    printedEven = true;
+                    break;
+            }
+
+            var fullyPrinted = printedOdd && printedEven;
+            if (r.OrderProcessId > 0)
+                DbSetPrintedSidesById(r.OrderProcessId, printedOdd, printedEven);
+
+            r.PrintedOddSide = printedOdd;
+            r.PrintedEvenSide = printedEven;
+            r.IsPrinted = fullyPrinted;
+            RefreshOrderFulfillmentOnRows();
+        }
+
+        /// <summary>PDF gabungan Random pages di %TEMP% — hapus agar tidak menumpuk.</summary>
+        private void TryDeleteTempMergedPdfIfNeeded(JobRow r)
+        {
+            if (string.IsNullOrWhiteSpace(r.File)) return;
+            if (!r.DeleteTempMergedPdfAfterUse && !IsTempPaperbellMergedPdfPath(r.File)) return;
+            try
+            {
+                if (File.Exists(r.File))
+                    File.Delete(r.File);
+            }
+            catch (Exception ex)
+            {
+                LogPrint("Hapus PDF temp gagal: " + r.File + " — " + ex.Message);
+            }
+        }
+
+        private static bool IsTempPaperbellMergedPdfPath(string path)
+        {
+            try
+            {
+                var name = Path.GetFileName(path);
+                return name.StartsWith("paperbell_random_", StringComparison.OrdinalIgnoreCase)
+                       && name.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void DeleteTempMergedPdfsForAllRowsInQueue()
+        {
+            foreach (var r in Rows.ToList())
+                TryDeleteTempMergedPdfIfNeeded(r);
         }
 
         private static string? TryFindSumatra()
@@ -5411,7 +7614,7 @@ public MainWindow()
         // Progress monitoring (Windows spooler, best-effort)
         // =====================
 
-        private async Task MonitorPrintJobAsync(JobRow r, CancellationToken ct)
+        private async Task MonitorPrintJobAsync(JobRow r, string queuePrinterName, CancellationToken ct)
         {
             try
             {
@@ -5419,7 +7622,7 @@ public MainWindow()
                 await Task.Delay(350, ct);
 
                 var server = new LocalPrintServer();
-                var qName = ResolvePrinterName(r.Printer) ?? r.Printer;
+                var qName = queuePrinterName;
                 var queue = server.GetPrintQueue(qName);
 
                 var fileName = Path.GetFileName(r.File);
@@ -5552,6 +7755,13 @@ public MainWindow()
             }
 
             SelectResiPrinterDefaultOrRestore(previous);
+
+            // Jika override printer sudah tidak tersedia, reset ke auto.
+            if (!string.IsNullOrWhiteSpace(_overrideBrotherPrinter) && !Printers.Contains(_overrideBrotherPrinter))
+                _overrideBrotherPrinter = null;
+            if (!string.IsNullOrWhiteSpace(_overrideL3210Printer) && !Printers.Contains(_overrideL3210Printer))
+                _overrideL3210Printer = null;
+            UpdateOverridePrinterStatusUi();
         }
 
         // =====================================================================
@@ -5708,6 +7918,7 @@ RebuildSearchIndex();
 
         private void LoadTopOrderProcessFromDb(int top = 20)
         {
+            DeleteTempMergedPdfsForAllRowsInQueue();
             Rows.Clear();
 
             using var con = OpenDb();
@@ -6080,6 +8291,13 @@ if (map != null)
         DuplexShortEdge
     }
 
+    public enum PrintSideMode
+    {
+        All,
+        Ganjil,
+        Genap
+    }
+
     public enum PaperPreset
     {
         Default, // use driver default / PDF size
@@ -6148,6 +8366,72 @@ if (map != null)
 
         public string ResiPrintedLabel => ResiPrinted ? "Sudah dicetak" : "Belum dicetak label";
 
+        public string NotesText
+        {
+            get => _notesText;
+            set
+            {
+                if (_notesText == value) return;
+                _notesText = value ?? "";
+                On();
+                On(nameof(NotesDisplayText));
+            }
+        }
+
+        private string _notesText = "";
+
+        public string NotesDisplayText => string.IsNullOrWhiteSpace(_notesText) ? "-" : _notesText;
+
+        public bool HasNotes => !string.IsNullOrWhiteSpace(_notesText);
+
+        public int ProductLinesTotal { get; private set; }
+        public int ProductLinesNotPrinted { get; private set; }
+
+        public bool AllProductsPrinted =>
+            ProductLinesTotal > 0 && ProductLinesNotPrinted == 0;
+
+        public string AllProductsPrintedLabel
+        {
+            get
+            {
+                if (ProductLinesTotal <= 0)
+                    return "Tidak ada baris produk";
+                if (AllProductsPrinted)
+                    return "Ya";
+                var done = ProductLinesTotal - ProductLinesNotPrinted;
+                return $"Belum ({done}/{ProductLinesTotal})";
+            }
+        }
+
+        public void ApplyProductPrintProgress(int notPrinted, int total)
+        {
+            ProductLinesNotPrinted = Math.Max(0, notPrinted);
+            ProductLinesTotal = Math.Max(0, total);
+            On(nameof(ProductLinesTotal));
+            On(nameof(ProductLinesNotPrinted));
+            On(nameof(AllProductsPrinted));
+            On(nameof(AllProductsPrintedLabel));
+        }
+
+        public string ShopeeOrderStatus
+        {
+            get => _shopeeOrderStatus;
+            set
+            {
+                _shopeeOrderStatus = value ?? "";
+                On();
+                On(nameof(IsOrderCancelled));
+                On(nameof(CanProcessLabel));
+            }
+        }
+
+        private string _shopeeOrderStatus = "";
+
+        public bool IsOrderCancelled =>
+            string.Equals((_shopeeOrderStatus ?? "").Trim(), "CANCELLED", StringComparison.OrdinalIgnoreCase);
+
+        public bool CanProcessLabel => !IsOrderCancelled;
+
         public event PropertyChangedEventHandler? PropertyChanged;
 
         private void On([CallerMemberName] string? n = null) =>
@@ -6159,6 +8443,7 @@ if (map != null)
         public int Index { get => _index; set { _index = value; On(); } }
         public string File { get => _file; set { _file = value; On(); } }
         public string Printer { get => _printer; set { _printer = value; On(); } }
+        public bool IsPrinterEditable { get => _isPrinterEditable; set { _isPrinterEditable = value; On(); } }
 
         // sync guard supaya nggak loop
         private bool _syncingPages;
@@ -6166,27 +8451,291 @@ if (map != null)
         public string OrderNo { get => _orderNo; set { _orderNo = value; On(); } }
         private string _orderNo = "";
 
+        public OrderFulfillmentStatus OrderFulfillmentStatus
+        {
+            get => _orderFulfillmentStatus;
+            private set
+            {
+                if (_orderFulfillmentStatus == value) return;
+                _orderFulfillmentStatus = value;
+                On();
+                NotifyOrderFulfillmentDerived();
+            }
+        }
 
-        
+        private OrderFulfillmentStatus _orderFulfillmentStatus = OrderFulfillmentStatus.PendingPrint;
+
+        public int OrderLinesTotal { get; private set; }
+        public int OrderLinesNotPrinted { get; private set; }
+
+        public bool IsOrderReadyToPack => OrderFulfillmentStatus == OrderFulfillmentStatus.ReadyToPack;
+
+        public bool ShowOrderPackBadge =>
+            OrderProcessId > 0 &&
+            OrderFulfillmentStatus != OrderFulfillmentStatus.Cancelled;
+
+        public string OrderPackBadgeText
+        {
+            get
+            {
+                return OrderFulfillmentStatus switch
+                {
+                    OrderFulfillmentStatus.ReadyToPack => "SIAP BUNGKUS",
+                    OrderFulfillmentStatus.WaitingResi => "Tunggu label",
+                    OrderFulfillmentStatus.PendingPrint when OrderLinesTotal > 0 =>
+                        $"{OrderLinesNotPrinted}/{OrderLinesTotal} belum cetak",
+                    OrderFulfillmentStatus.PendingPrint => "Belum cetak",
+                    _ => ""
+                };
+            }
+        }
+
+        public string OrderProgressLabel
+        {
+            get
+            {
+                return OrderFulfillmentStatus switch
+                {
+                    OrderFulfillmentStatus.ReadyToPack =>
+                        $"Semua produk + label selesai ({OrderLinesTotal} item)",
+                    OrderFulfillmentStatus.WaitingResi =>
+                        $"Produk selesai ({OrderLinesTotal} item) · label belum",
+                    OrderFulfillmentStatus.PendingPrint when OrderLinesTotal > 0 =>
+                        $"{OrderLinesTotal - OrderLinesNotPrinted}/{OrderLinesTotal} cetak · label belum",
+                    _ => "Status order tidak diketahui"
+                };
+            }
+        }
+
+        public string PackMissingDescription { get; private set; } = "";
+
+        public void ApplyOrderFulfillment(OrderFulfillmentInfo? info)
+        {
+            if (info == null)
+            {
+                OrderLinesTotal = 0;
+                OrderLinesNotPrinted = 0;
+                OrderFulfillmentStatus = OrderFulfillmentStatus.PendingPrint;
+                PackMissingDescription = "";
+                On(nameof(PackMissingDescription));
+                return;
+            }
+
+            OrderLinesTotal = info.TotalLines;
+            OrderLinesNotPrinted = info.NotPrintedLines;
+            OrderFulfillmentStatus = info.Status;
+            PackMissingDescription = info.GetPackMissingDescription();
+            On(nameof(PackMissingDescription));
+        }
 
         public string ProductName { get => _productName; set { _productName = value; On(); } }
         private string _productName = "";
-public string VariationName { get => _variationName; set { _variationName = value; On(); } }
+public string VariationName
+{
+    get => _variationName;
+    set
+    {
+        _variationName = value;
+        On();
+        On(nameof(IsSixHoleVariation));
+    }
+}
         private string _variationName = "";
+        public bool IsSixHoleVariation =>
+            Regex.IsMatch(_variationName ?? "", @"\b6\s*lubang\b", RegexOptions.IgnoreCase);
 
-        public long OrderProcessId { get => _orderProcessId; set { _orderProcessId = value; On(); On(nameof(CanTogglePrinted)); } }
+        public long OrderProcessId
+        {
+            get => _orderProcessId;
+            set
+            {
+                if (_orderProcessId == value) return;
+                _orderProcessId = value;
+                On();
+                On(nameof(CanTogglePrinted));
+                NotifyInventoryDerived();
+            }
+        }
         private long _orderProcessId;
 
         // Only Shopee rows from DB can be toggled
         public bool CanTogglePrinted { get => _canTogglePrinted; set { _canTogglePrinted = value; On(); } }
         private bool _canTogglePrinted;
 
-        public bool IsPrinted { get => _isPrinted; set { if (_isPrinted == value) return; _isPrinted = value; On(); } }
+        public bool IsPrinted
+        {
+            get => _isPrinted;
+            set
+            {
+                if (_isPrinted == value) return;
+                _isPrinted = value;
+                On();
+                NotifyInventoryDerived();
+            }
+        }
         private bool _isPrinted;
+
+        public bool PrintedOddSide
+        {
+            get => _printedOddSide;
+            set
+            {
+                if (_printedOddSide == value) return;
+                _printedOddSide = value;
+                On();
+                On(nameof(PrintedSideStatusLabel));
+            }
+        }
+        private bool _printedOddSide;
+
+        public bool PrintedEvenSide
+        {
+            get => _printedEvenSide;
+            set
+            {
+                if (_printedEvenSide == value) return;
+                _printedEvenSide = value;
+                On();
+                On(nameof(PrintedSideStatusLabel));
+            }
+        }
+        private bool _printedEvenSide;
+
+        public PrintSideMode PrintSide
+        {
+            get => _printSide;
+            set
+            {
+                if (_printSide == value) return;
+                _printSide = value;
+                if (value != PrintSideMode.All && _duplex != DuplexMode.Simplex)
+                {
+                    _duplex = DuplexMode.Simplex;
+                    On(nameof(Duplex));
+                }
+                On();
+                On(nameof(IsDuplexEditable));
+            }
+        }
+        private PrintSideMode _printSide = PrintSideMode.All;
+
+        /// <summary>Duplex hanya bisa diubah saat Print side = All (ganjil/genap memakai simplex).</summary>
+        public bool IsDuplexEditable => PrintSide == PrintSideMode.All;
+        public string PrintedSideStatusLabel => $"Odd:{(PrintedOddSide ? "Y" : "N")} Even:{(PrintedEvenSide ? "Y" : "N")}";
 
         // kode variasi / No. Referensi yang dipakai untuk mapping
         public string VariationCode { get => _variationCode; set { _variationCode = value; On(); } }
         private string _variationCode = "";
+
+        /// <summary>Qty baris order dari Shopee (<c>order_process.qty</c>).</summary>
+        public int OrderItemQty
+        {
+            get => _orderItemQty;
+            set
+            {
+                if (_orderItemQty == value) return;
+                _orderItemQty = Math.Max(0, value);
+                On();
+                NotifyInventoryDerived();
+            }
+        }
+        private int _orderItemQty;
+
+        /// <summary>Stok tersedia di <c>product_inventory</c> untuk <see cref="VariationCode"/> (item_key).</summary>
+        public int InventoryAvailableQty
+        {
+            get => _inventoryAvailableQty;
+            set
+            {
+                if (_inventoryAvailableQty == value) return;
+                _inventoryAvailableQty = Math.Max(0, value);
+                On();
+                NotifyInventoryDerived();
+            }
+        }
+        private int _inventoryAvailableQty;
+
+        public bool HasInventoryMatch => InventoryAvailableQty > 0 && OrderProcessId > 0;
+
+        public bool CanUseInventory =>
+            HasInventoryMatch &&
+            OrderItemQty > 0 &&
+            !IsShopeeOrderCancelled &&
+            !IsPrinted;
+
+        public string UseInventoryButtonText
+        {
+            get
+            {
+                if (OrderItemQty > 0 && InventoryAvailableQty < OrderItemQty)
+                    return $"Use inventory ({InventoryAvailableQty}/{OrderItemQty})";
+                return $"Use inventory ({InventoryAvailableQty})";
+            }
+        }
+
+        public string InventoryTooltip
+        {
+            get
+            {
+                if (!CanUseInventory && !HasInventoryMatch)
+                    return $"Stok: {InventoryAvailableQty} / dibutuhkan {OrderItemQty}";
+                if (InventoryAvailableQty <= 0)
+                    return "Tidak ada stok inventory";
+                if (InventoryAvailableQty >= OrderItemQty)
+                    return $"Pakai {OrderItemQty} dari stok — tandai sudah dicetak ({InventoryAvailableQty} tersedia)";
+                var use = Math.Min(InventoryAvailableQty, OrderItemQty);
+                var remain = OrderItemQty - use;
+                return $"Pakai {use} dari stok, sisa {remain} qty masih perlu dicetak ({InventoryAvailableQty} tersedia)";
+            }
+        }
+
+        private void NotifyInventoryDerived()
+        {
+            On(nameof(HasInventoryMatch));
+            On(nameof(CanUseInventory));
+            On(nameof(UseInventoryButtonText));
+            On(nameof(InventoryTooltip));
+        }
+
+        private void NotifyOrderFulfillmentDerived()
+        {
+            On(nameof(OrderFulfillmentStatus));
+            On(nameof(OrderLinesTotal));
+            On(nameof(OrderLinesNotPrinted));
+            On(nameof(IsOrderReadyToPack));
+            On(nameof(ShowOrderPackBadge));
+            On(nameof(OrderPackBadgeText));
+            On(nameof(OrderProgressLabel));
+            On(nameof(PackMissingDescription));
+        }
+
+        /// <summary>Nilai <c>order_status</c> Shopee di DB (PROCESSED, IN_CANCEL, CANCELLED, …).</summary>
+        public string ShopeeOrderStatus
+        {
+            get => _shopeeOrderStatus;
+            set
+            {
+                _shopeeOrderStatus = value ?? "";
+                On();
+                On(nameof(ShowCancelRequestBanner));
+                On(nameof(IsShopeeOrderCancelled));
+                On(nameof(CanPrintOrder));
+                NotifyInventoryDerived();
+                NotifyOrderFulfillmentDerived();
+            }
+        }
+
+        private string _shopeeOrderStatus = "";
+
+        /// <summary>Buyer minta batal — masih tampil di Not Printed dengan peringatan.</summary>
+        public bool ShowCancelRequestBanner =>
+            string.Equals((_shopeeOrderStatus ?? "").Trim(), "IN_CANCEL", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>Order sudah dibatalkan — hanya tab Cancel; cetak dinonaktifkan.</summary>
+        public bool IsShopeeOrderCancelled =>
+            string.Equals((_shopeeOrderStatus ?? "").Trim(), "CANCELLED", StringComparison.OrdinalIgnoreCase);
+
+        public bool CanPrintOrder => !IsShopeeOrderCancelled;
 
         public DateTime? OrderCreatedAt { get => _orderCreatedAt; set { _orderCreatedAt = value; On(); On(nameof(OrderCreatedText)); } }
         private DateTime? _orderCreatedAt;
@@ -6331,7 +8880,17 @@ public string VariationName { get => _variationName; set { _variationName = valu
 
 
         public int Copies { get => _copies; set { _copies = Math.Max(1, value); On(); } }
-        public DuplexMode Duplex { get => _duplex; set { _duplex = value; On(); } }
+        public DuplexMode Duplex
+        {
+            get => _duplex;
+            set
+            {
+                if (_duplex == value) return;
+                _duplex = value;
+                On();
+                On(nameof(IsDuplexEditable));
+            }
+        }
         public PaperPreset Paper { get => _paper; set { _paper = value; On(); } }
 
         /// <summary>1.0 = isi memakai penuh kotak margin (Pdfium+GDI). &lt;1 = diperkecil di dalam margin.</summary>
@@ -6354,6 +8913,7 @@ public string VariationName { get => _variationName; set { _variationName = valu
         private int _index;
         private string _file = "";
         private string _printer = "";
+        private bool _isPrinterEditable = true;
 
         private string _pageRange = "1";
         private int _pageFrom = 1;
@@ -6387,6 +8947,9 @@ public string VariationName { get => _variationName; set { _variationName = valu
             get => _printedPages;
             set { _printedPages = value; On(); }
         }
+
+        /// <summary>True untuk PDF gabungan Random pages di folder temp — file dihapus setelah cetak OK atau baris dihapus.</summary>
+        public bool DeleteTempMergedPdfAfterUse { get; set; }
     }
 
     public class PageThumb
