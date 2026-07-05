@@ -18,6 +18,7 @@ namespace PaperbellAppDotNet
     public sealed class OrderPackDetailInfo
     {
         public string OrderSn { get; init; } = "";
+        public string CustomerText { get; init; } = "";
         public string ResiStatusText { get; init; } = "";
         public string PrintSummaryText { get; init; } = "";
         public string PackSummaryText { get; init; } = "";
@@ -31,6 +32,7 @@ namespace PaperbellAppDotNet
         {
             InitializeComponent();
             TxtOrderSn.Text = "Order: " + info.OrderSn;
+            TxtCustomer.Text = info.CustomerText;
             TxtResiStatus.Text = info.ResiStatusText;
             TxtPrintSummary.Text = info.PrintSummaryText;
             TxtPackSummary.Text = info.PackSummaryText;

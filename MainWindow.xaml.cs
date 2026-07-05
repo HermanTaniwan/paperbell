@@ -1202,7 +1202,7 @@ namespace PaperbellAppDotNet
 // ✅ Shopee Open Platform V2 (Connect + SQLite state + save order process)
 // =====================
 private const long PartnerId = 2014528;
-private const string PartnerKey = "shpk775655535a714c7243495256765a66737058417a59506c4a48525a765468";
+private const string PartnerKey = "shpk626278534e75556f516c4e6d53746e68766a4b6a714b436f4f436c464472";
 private const string ApiHost = "https://partner.shopeemobile.com";
 private const string RedirectUrl = "http://localhost:5123/callback/";
 
@@ -1667,15 +1667,199 @@ FROM (
         {
             var sns = Rows.Select(r => r.OrderNo).Where(s => !string.IsNullOrWhiteSpace(s)).ToList();
             var map = LoadOrderFulfillmentBatch(sns);
+            var notesMap = LoadOrderNotesBatch(sns);
+            var customerMap = LoadCustomerInfoBatch(sns);
             foreach (var row in Rows)
             {
                 if (string.IsNullOrWhiteSpace(row.OrderNo))
                     continue;
                 map.TryGetValue(row.OrderNo, out var info);
                 row.ApplyOrderFulfillment(info);
+                row.NotesText = notesMap.TryGetValue(row.OrderNo, out var notesText) ? notesText : "";
+                if (customerMap.TryGetValue(row.OrderNo, out var customerInfo))
+                {
+                    row.CustomerUsername = customerInfo.CustomerUsername;
+                    row.CustomerPurchaseCountLastYear = customerInfo.PurchaseCountLastYear;
+                }
+                else
+                {
+                    row.CustomerUsername = "";
+                    row.CustomerPurchaseCountLastYear = 0;
+                }
             }
 
             UpdateOrderFulfillmentSummaryUi();
+        }
+
+        private Dictionary<string, string> LoadOrderNotesBatch(IReadOnlyCollection<string> orderSns)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var sns = orderSns
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (sns.Count == 0)
+                return result;
+
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            var placeholders = string.Join(",", sns.Select((_, i) => $"$s{i}"));
+            cmd.CommandText = $@"
+SELECT order_sn, raw_json
+FROM orders
+WHERE order_sn IN ({placeholders})
+  AND raw_json IS NOT NULL
+  AND raw_json <> '';
+";
+            for (var i = 0; i < sns.Count; i++)
+                cmd.Parameters.AddWithValue($"$s{i}", sns[i]);
+
+            using var rd = cmd.ExecuteReader();
+            while (rd.Read())
+            {
+                var sn = rd.IsDBNull(0) ? "" : rd.GetString(0);
+                var rawJson = rd.IsDBNull(1) ? "" : rd.GetString(1);
+                if (string.IsNullOrWhiteSpace(sn) || string.IsNullOrWhiteSpace(rawJson))
+                    continue;
+
+                var notes = ExtractOrderNotesText(rawJson);
+                if (!string.IsNullOrWhiteSpace(notes))
+                    result[sn] = notes;
+            }
+
+            return result;
+        }
+
+        private Dictionary<string, (string CustomerUsername, int PurchaseCountLastYear)> LoadCustomerInfoBatch(
+            IReadOnlyCollection<string> orderSns)
+        {
+            var result = new Dictionary<string, (string CustomerUsername, int PurchaseCountLastYear)>(StringComparer.OrdinalIgnoreCase);
+            var sns = orderSns
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (sns.Count == 0)
+                return result;
+
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            var placeholders = string.Join(",", sns.Select((_, i) => $"$s{i}"));
+            var fromUnix = DateTimeOffset.UtcNow.AddDays(-365).ToUnixTimeSeconds();
+            cmd.CommandText = $@"
+WITH target AS (
+    SELECT order_sn, COALESCE(NULLIF(TRIM(buyer_username), ''), '') AS buyer_username
+    FROM orders
+    WHERE order_sn IN ({placeholders})
+),
+counts AS (
+    SELECT buyer_username, COUNT(*) AS total_orders
+    FROM orders
+    WHERE create_time >= $from
+      AND IFNULL(UPPER(TRIM(status)), '') <> 'CANCELLED'
+      AND IFNULL(TRIM(buyer_username), '') <> ''
+    GROUP BY buyer_username
+)
+SELECT t.order_sn,
+       t.buyer_username,
+       COALESCE(c.total_orders, 0)
+FROM target t
+LEFT JOIN counts c ON c.buyer_username = t.buyer_username
+WHERE IFNULL(TRIM(t.buyer_username), '') <> '';
+";
+            cmd.Parameters.AddWithValue("$from", fromUnix);
+            for (var i = 0; i < sns.Count; i++)
+                cmd.Parameters.AddWithValue($"$s{i}", sns[i]);
+
+            using var rd = cmd.ExecuteReader();
+            while (rd.Read())
+            {
+                var sn = rd.IsDBNull(0) ? "" : rd.GetString(0);
+                var buyerUsername = rd.IsDBNull(1) ? "" : rd.GetString(1);
+                var total = rd.IsDBNull(2) ? 0 : Convert.ToInt32(rd.GetValue(2));
+                if (string.IsNullOrWhiteSpace(sn) || string.IsNullOrWhiteSpace(buyerUsername))
+                    continue;
+
+                result[sn] = (buyerUsername, total);
+            }
+
+            return result;
+        }
+
+        private void ApplyCustomerInfoToRows(
+            IReadOnlyCollection<JobRow> rows,
+            IReadOnlyDictionary<string, (string CustomerUsername, int PurchaseCountLastYear)> stats)
+        {
+            foreach (var row in rows)
+            {
+                if (row == null || string.IsNullOrWhiteSpace(row.OrderNo))
+                    continue;
+
+                if (stats.TryGetValue(row.OrderNo, out var info))
+                {
+                    row.CustomerUsername = info.CustomerUsername;
+                    row.CustomerPurchaseCountLastYear = info.PurchaseCountLastYear;
+                }
+                else
+                {
+                    row.CustomerUsername = "";
+                    row.CustomerPurchaseCountLastYear = 0;
+                }
+            }
+        }
+
+        private async Task EnsureCustomerInfoForVisibleRowsAsync(IReadOnlyList<JobRow> rows)
+        {
+            var orderSns = rows
+                .Where(r => r != null && !string.IsNullOrWhiteSpace(r.OrderNo))
+                .Select(r => r.OrderNo)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (orderSns.Count == 0)
+                return;
+
+            var stats = LoadCustomerInfoBatch(orderSns);
+            ApplyCustomerInfoToRows(rows, stats);
+
+            var missing = rows
+                .Where(r => r != null &&
+                            !string.IsNullOrWhiteSpace(r.OrderNo) &&
+                            !stats.TryGetValue(r.OrderNo, out var info) &&
+                            string.IsNullOrWhiteSpace(r.CustomerUsername))
+                .Select(r => r.OrderNo)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (missing.Count == 0 || !IsConnected())
+                return;
+
+            try
+            {
+                var noopProgress = new Progress<SyncProgress>(_ => { });
+                var details = await GetOrderDetailBatchRawAsync(missing, noopProgress, CancellationToken.None);
+                foreach (var order in details)
+                {
+                    var orderSn = order.TryGetProperty("order_sn", out var snEl) ? snEl.GetString() ?? "" : "";
+                    if (string.IsNullOrWhiteSpace(orderSn))
+                        continue;
+
+                    var status = order.TryGetProperty("order_status", out var st) ? st.GetString() ?? "" : "";
+                    var createTime = order.TryGetProperty("create_time", out var ct) ? ct.GetInt64() : 0;
+                    var updateTime = order.TryGetProperty("update_time", out var ut) ? ut.GetInt64() : 0;
+
+                    UpsertOrderRaw(orderSn, status, createTime, updateTime, order.GetRawText());
+                    UpsertOrderProcessFromOrderJson(order);
+                }
+
+                stats = LoadCustomerInfoBatch(orderSns);
+                ApplyCustomerInfoToRows(rows, stats);
+            }
+            catch
+            {
+                // Keep the UI usable even when the backfill fetch fails.
+            }
         }
 
         private Dictionary<string, (int NotPrinted, int Total)> LoadProductPrintProgressForResiBatch(
@@ -1886,11 +2070,13 @@ LIMIT $take OFFSET $skip;
             var sn = (orderSn ?? "").Trim();
             var lines = new List<OrderPackDetailLine>();
             var notesText = "";
+            var customerText = "Customer: belum tersedia";
             if (string.IsNullOrEmpty(sn))
             {
                 return new OrderPackDetailInfo
                 {
                     OrderSn = sn,
+                    CustomerText = customerText,
                     ResiStatusText = "",
                     PrintSummaryText = "Tidak ada data.",
                     PackSummaryText = "",
@@ -1989,12 +2175,20 @@ LIMIT 1;
                 }
             }
 
+            var customerMap = LoadCustomerInfoBatch(new[] { sn });
+            if (customerMap.TryGetValue(sn, out var customerInfo) &&
+                !string.IsNullOrWhiteSpace(customerInfo.CustomerUsername))
+            {
+                customerText = $"Customer: {customerInfo.CustomerUsername} · {customerInfo.PurchaseCountLastYear}x beli 1 thn";
+            }
+
             var printedCount = total - notPrinted;
             var info = OrderFulfillmentInfo.FromAggregate(notPrinted, total, resiPrinted, false);
 
             return new OrderPackDetailInfo
             {
                 OrderSn = sn,
+                CustomerText = customerText,
                 ResiStatusText = resiPrinted
                     ? "Label pengiriman: sudah dicetak"
                     : "Label pengiriman: belum dicetak",
@@ -2061,7 +2255,7 @@ LIMIT 1;
                         {
                             var text = ExtractNoteText(prop.Value);
                             if (!string.IsNullOrWhiteSpace(text))
-                                notes.Add($"{FormatNoteLabel(name)}: {text}");
+                                notes.Add(text);
                         }
 
                         if (prop.Value.ValueKind is JsonValueKind.Object or JsonValueKind.Array)
@@ -2133,6 +2327,189 @@ LIMIT 1;
             var info = BuildOrderPackDetail(row.OrderSn);
             var w = new OrderPackDetailWindow(info) { Owner = this };
             w.ShowDialog();
+        }
+
+        private CustomerHistoryInfo BuildCustomerHistory(string customerUsername)
+        {
+            var username = (customerUsername ?? "").Trim();
+            var lines = new List<CustomerHistoryLine>();
+            if (string.IsNullOrWhiteSpace(username))
+            {
+                return new CustomerHistoryInfo
+                {
+                    CustomerUsername = "",
+                    SummaryText = "Belum ada data customer untuk ditampilkan.",
+                    Lines = lines
+                };
+            }
+
+            var orderSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var totalQty = 0;
+            var fromUnix = DateTimeOffset.UtcNow.AddDays(-365).ToUnixTimeSeconds();
+
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = """
+SELECT o.order_sn,
+       o.create_time,
+       op.item_name,
+       op.model_name,
+       COALESCE(op.qty, 0)
+FROM orders o
+JOIN order_process op ON op.order_sn = o.order_sn
+WHERE IFNULL(TRIM(o.buyer_username), '') = $buyer
+  AND o.create_time >= $from
+  AND IFNULL(UPPER(TRIM(o.status)), '') <> 'CANCELLED'
+ORDER BY o.create_time DESC, o.order_sn DESC, op.id ASC;
+""";
+            cmd.Parameters.AddWithValue("$buyer", username);
+            cmd.Parameters.AddWithValue("$from", fromUnix);
+
+            using var rd = cmd.ExecuteReader();
+            while (rd.Read())
+            {
+                var orderSn = rd.IsDBNull(0) ? "" : rd.GetString(0);
+                var createTime = rd.IsDBNull(1) ? 0 : rd.GetInt64(1);
+                var itemName = rd.IsDBNull(2) ? "" : rd.GetString(2);
+                var modelName = rd.IsDBNull(3) ? "" : rd.GetString(3);
+                var qty = rd.IsDBNull(4) ? 0 : rd.GetInt32(4);
+
+                if (!string.IsNullOrWhiteSpace(orderSn))
+                    orderSet.Add(orderSn);
+                totalQty += Math.Max(0, qty);
+
+                lines.Add(new CustomerHistoryLine
+                {
+                    OrderSn = orderSn,
+                    OrderCreatedText = createTime > 0
+                        ? UnixToLocalDateTime(createTime)?.ToString("yyyy-MM-dd HH:mm") ?? ""
+                        : "",
+                    ItemName = itemName,
+                    ModelName = modelName,
+                    Qty = Math.Max(0, qty)
+                });
+            }
+
+            var summary = lines.Count == 0
+                ? "Belum ada riwayat order 1 tahun terakhir."
+                : $"1 tahun terakhir: {orderSet.Count} order, {lines.Count} baris item, total qty {totalQty}.";
+
+            return new CustomerHistoryInfo
+            {
+                CustomerUsername = username,
+                SummaryText = summary,
+                Lines = lines
+            };
+        }
+
+        private void CustomerHistory_Click(object sender, RoutedEventArgs e)
+        {
+            if ((sender as FrameworkElement)?.DataContext is not JobRow row)
+                return;
+            if (string.IsNullOrWhiteSpace(row.CustomerUsername))
+                return;
+
+            var info = BuildCustomerHistory(row.CustomerUsername);
+            var w = new CustomerHistoryWindow(info) { Owner = this };
+            w.ShowDialog();
+        }
+
+        private async void PackOrderRefresh_Click(object sender, RoutedEventArgs e)
+        {
+            if ((sender as FrameworkElement)?.DataContext is not PackOrderRow row)
+                return;
+            if (string.IsNullOrWhiteSpace(row.OrderSn))
+                return;
+
+            var win = new SyncLogWindow { Owner = this };
+            win.Show();
+            await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Background);
+
+            IProgress<SyncProgress> progress =
+                new System.Progress<SyncProgress>(p =>
+                {
+                    if (!string.IsNullOrWhiteSpace(p.Log))
+                        win.AppendLog(p.Log);
+                    win.SetProgress(p.Percent, p.Label);
+                });
+
+            try
+            {
+                IsEnabled = false;
+
+                var cts = new CancellationTokenSource();
+                win.CancelRequested += () => cts.Cancel();
+
+                await Task.Run(async () =>
+                {
+                    progress.Report(new SyncProgress
+                    {
+                        Percent = 5,
+                        Label = "Refreshing...",
+                        Log = $"Refreshing order {row.OrderSn}..."
+                    });
+
+                    var orders = await GetOrderDetailBatchRawAsync(
+                        new List<string> { row.OrderSn },
+                        progress,
+                        cts.Token);
+
+                    if (orders.Count == 0)
+                    {
+                        progress.Report(new SyncProgress
+                        {
+                            Percent = 100,
+                            Label = "No data",
+                            Log = $"No order detail returned for {row.OrderSn}."
+                        });
+                        return;
+                    }
+
+                    foreach (var o in orders)
+                    {
+                        var orderSn = o.TryGetProperty("order_sn", out var sn) ? sn.GetString() : "";
+                        if (string.IsNullOrWhiteSpace(orderSn))
+                            continue;
+
+                        var status = o.TryGetProperty("order_status", out var st) ? st.GetString() ?? "" : "";
+                        var createTime = o.TryGetProperty("create_time", out var ct) ? ct.GetInt64() : 0;
+                        var updateTime = o.TryGetProperty("update_time", out var ut) ? ut.GetInt64() : 0;
+
+                        UpsertOrderRaw(orderSn, status, createTime, updateTime, o.GetRawText());
+                        UpsertOrderProcessFromOrderJson(o);
+                    }
+
+                    progress.Report(new SyncProgress
+                    {
+                        Percent = 100,
+                        Label = "Done",
+                        Log = $"Refresh completed for {row.OrderSn}."
+                    });
+                }, cts.Token);
+
+                LoadShopeePageFromDb(_shopeePageIndex);
+
+                win.SetDone("Refresh completed ✅");
+
+                var info = BuildOrderPackDetail(row.OrderSn);
+                var detailWin = new OrderPackDetailWindow(info) { Owner = this };
+                detailWin.ShowDialog();
+            }
+            catch (OperationCanceledException)
+            {
+                win.AppendLog("Cancelled by user.");
+                win.SetDone("Refresh cancelled ⚠️");
+            }
+            catch (Exception ex)
+            {
+                win.AppendLog("ERROR: " + ex);
+                win.SetDone("Refresh failed ❌");
+            }
+            finally
+            {
+                IsEnabled = true;
+            }
         }
 
         private void MarkOrderPackaged_Click(object sender, RoutedEventArgs e)
@@ -2351,6 +2728,7 @@ LIMIT $take OFFSET $skip;
             }
 
             RefreshOrderFulfillmentOnRows();
+            _ = EnsureCustomerInfoForVisibleRowsAsync(Rows.ToList());
             UpdateShopeePagingUi();
             RefreshViews();
         }
@@ -2492,6 +2870,17 @@ private void InitDatabase()
     con.Open();
     Paperbell_App.App.Trace("InitDatabase: connection opened");
 
+    try
+    {
+        using var alter = con.CreateCommand();
+        alter.CommandText = "ALTER TABLE orders ADD COLUMN buyer_username TEXT;";
+        alter.ExecuteNonQuery();
+    }
+    catch (Exception)
+    {
+        // Column already exists on upgraded databases.
+    }
+
     using var cmd = con.CreateCommand();
     cmd.CommandText =
         """
@@ -2505,6 +2894,7 @@ private void InitDatabase()
             status TEXT,
             create_time INTEGER,
             update_time INTEGER,
+            buyer_username TEXT,
             raw_json TEXT
         );
 
@@ -3280,10 +3670,13 @@ private async Task<List<JsonElement>> GetOrderDetailBatchRawAsync(
         {
     var path = "/api/v2/order/get_order_detail";
 
+    // Shopee docs expose `message_to_seller` by default and `note`/`note_update_time`
+    // as optional fields. Keep both in the stored payload so the UI can render notes
+    // even when one of the fields is absent.
     var query = new Dictionary<string, string>
     {
         ["order_sn_list"] = string.Join(",", orderSnList),
-        ["response_optional_fields"] = "order_status,create_time,update_time,item_list"
+        ["response_optional_fields"] = "order_status,create_time,update_time,item_list,buyer_username,note,note_update_time"
     };
 
     var doc = await GetShopApiWithLogAsync(path, query, progress, ct); ;
@@ -3299,24 +3692,49 @@ private async Task<List<JsonElement>> GetOrderDetailBatchRawAsync(
     return new List<JsonElement>();
 }
 
+        private static string ExtractBuyerUsernameFromRawJson(string rawJson)
+        {
+            if (string.IsNullOrWhiteSpace(rawJson))
+                return "";
+
+            try
+            {
+                using var doc = JsonDocument.Parse(rawJson);
+                if (doc.RootElement.TryGetProperty("buyer_username", out var buyerUsername) &&
+                    buyerUsername.ValueKind == JsonValueKind.String)
+                {
+                    return buyerUsername.GetString()?.Trim() ?? "";
+                }
+            }
+            catch
+            {
+                // ignore malformed json
+            }
+
+            return "";
+        }
+
 private void UpsertOrderRaw(string orderSn, string status, long createTime, long updateTime, string rawJson)
 {
     using var con = OpenDb();
     con.Open();
 
+    var buyerUsername = ExtractBuyerUsernameFromRawJson(rawJson);
     using var cmd = con.CreateCommand();
     cmd.CommandText = @"
-INSERT INTO orders(order_sn,status,create_time,update_time,raw_json)
-VALUES($sn,$st,$ct,$ut,$rj)
+INSERT INTO orders(order_sn,status,create_time,update_time,buyer_username,raw_json)
+VALUES($sn,$st,$ct,$ut,$bu,$rj)
 ON CONFLICT(order_sn) DO UPDATE SET
   status=excluded.status,
   create_time=excluded.create_time,
   update_time=excluded.update_time,
+  buyer_username=excluded.buyer_username,
   raw_json=excluded.raw_json;";
     cmd.Parameters.AddWithValue("$sn", orderSn);
     cmd.Parameters.AddWithValue("$st", status ?? "");
     cmd.Parameters.AddWithValue("$ct", createTime);
     cmd.Parameters.AddWithValue("$ut", updateTime);
+    cmd.Parameters.AddWithValue("$bu", buyerUsername ?? "");
     cmd.Parameters.AddWithValue("$rj", rawJson ?? "");
     cmd.ExecuteNonQuery();
 }
@@ -3567,6 +3985,8 @@ ORDER BY create_time DESC;
             int idx = 1;
             foreach (var r in Rows.OrderByDescending(x => x.OrderCreatedAt ?? DateTime.MinValue).ToList())
                 r.Index = idx++;
+
+            _ = EnsureCustomerInfoForVisibleRowsAsync(Rows.ToList());
 
             // (optional) kamu bisa MessageBox kalau mau
             // MessageBox.Show($"Loaded {added} rows from DB");
@@ -5877,7 +6297,7 @@ LIMIT $take OFFSET $skip;";
                     new Dictionary<string, string?>
                     {
                         ["order_sn_list"] = string.Join(",", ordersn),
-                        ["response_optional_fields"] = "item_list,buyer_username,shipping_carrier"
+                        ["response_optional_fields"] = "item_list,buyer_username,shipping_carrier,note,note_update_time"
                     });
 
                 return detailResp?.Response?.OrderList ?? new List<ShopeeOrderDetail>();
@@ -5918,6 +6338,9 @@ LIMIT $take OFFSET $skip;";
         {
             [JsonPropertyName("order_sn")] public string? OrderSn { get; set; }
             [JsonPropertyName("create_time")] public long? CreateTimeUnix { get; set; }
+            [JsonPropertyName("message_to_seller")] public string? MessageToSeller { get; set; }
+            [JsonPropertyName("note")] public string? Note { get; set; }
+            [JsonPropertyName("note_update_time")] public long? NoteUpdateTimeUnix { get; set; }
             [JsonPropertyName("item_list")] public List<ShopeeOrderItem> ItemList { get; set; } = new();
 
             [JsonIgnore]
@@ -8508,6 +8931,62 @@ if (map != null)
         }
 
         public string PackMissingDescription { get; private set; } = "";
+
+        public string NotesText
+        {
+            get => _notesText;
+            set
+            {
+                if (_notesText == value) return;
+                _notesText = value ?? "";
+                On();
+                On(nameof(NotesDisplayText));
+                On(nameof(HasNotes));
+            }
+        }
+
+        private string _notesText = "";
+
+        public string NotesDisplayText => string.IsNullOrWhiteSpace(_notesText) ? "-" : _notesText;
+
+        public bool HasNotes => !string.IsNullOrWhiteSpace(_notesText);
+
+        public string CustomerUsername
+        {
+            get => _customerUsername;
+            set
+            {
+                var next = (value ?? "").Trim();
+                if (_customerUsername == next) return;
+                _customerUsername = next;
+                On();
+                On(nameof(CustomerInfoText));
+            }
+        }
+
+        private string _customerUsername = "";
+
+        public int CustomerPurchaseCountLastYear
+        {
+            get => _customerPurchaseCountLastYear;
+            set
+            {
+                var next = Math.Max(0, value);
+                if (_customerPurchaseCountLastYear == next) return;
+                _customerPurchaseCountLastYear = next;
+                On();
+                On(nameof(CustomerInfoText));
+            }
+        }
+
+        private int _customerPurchaseCountLastYear;
+
+        public bool HasCustomerInfo => !string.IsNullOrWhiteSpace(CustomerUsername);
+
+        public string CustomerInfoText =>
+            HasCustomerInfo
+                ? $"Customer: {CustomerUsername} · {CustomerPurchaseCountLastYear}x beli 1 thn"
+                : "Customer: belum tersedia";
 
         public void ApplyOrderFulfillment(OrderFulfillmentInfo? info)
         {

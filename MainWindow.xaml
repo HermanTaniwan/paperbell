@@ -367,6 +367,10 @@
                                                 Padding="8,4" Margin="0,0,0,4"
                                                 Click="PackOrderViewDetail_Click"
                                                 ToolTip="Lihat detail item dan status cetak per produk"/>
+                                        <Button Content="Refresh order"
+                                                Padding="8,4" Margin="0,0,0,4"
+                                                Click="PackOrderRefresh_Click"
+                                                ToolTip="Ambil ulang detail order dari Shopee, lalu tampilkan catatan terbaru"/>
                                         <Button Content="Sudah dibungkus"
                                                 Padding="8,4" Margin="0,0,0,4"
                                                 Click="MarkOrderPackaged_Click"
@@ -530,6 +534,36 @@ CanUserAddRows="False"
                                         <Run Text="Dibuat: "/>
                                         <Run Text="{Binding OrderCreatedText, Mode=OneWay}" />
                                     </TextBlock>
+
+                                    <Button Click="CustomerHistory_Click"
+                                            Padding="0"
+                                            Margin="0,2,0,0"
+                                            HorizontalAlignment="Left"
+                                            HorizontalContentAlignment="Left"
+                                            Background="Transparent"
+                                            BorderThickness="0"
+                                            IsEnabled="{Binding HasCustomerInfo}">
+                                        <Button.Style>
+                                            <Style TargetType="Button">
+                                                <Setter Property="Foreground" Value="#1565C0"/>
+                                                <Setter Property="Cursor" Value="Hand"/>
+                                                <Setter Property="ToolTip" Value="Klik untuk lihat riwayat customer"/>
+                                                <Style.Triggers>
+                                                    <Trigger Property="IsMouseOver" Value="True">
+                                                        <Setter Property="Foreground" Value="#0D47A1"/>
+                                                    </Trigger>
+                                                    <Trigger Property="IsEnabled" Value="False">
+                                                        <Setter Property="Foreground" Value="#555"/>
+                                                        <Setter Property="Cursor" Value="Arrow"/>
+                                                        <Setter Property="ToolTip" Value="Data customer belum tersedia"/>
+                                                    </Trigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </Button.Style>
+                                        <TextBlock Text="{Binding CustomerInfoText, Mode=OneWay}"
+                                                   TextWrapping="Wrap"
+                                                   FontSize="11"/>
+                                    </Button>
 
                                     <TextBlock TextWrapping="Wrap"
                                                Margin="0,2,0,0"
