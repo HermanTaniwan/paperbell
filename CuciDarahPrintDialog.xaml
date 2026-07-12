@@ -1,0 +1,45 @@
+<Window x:Class="PaperbellAppDotNet.CuciDarahPrintDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Cuci Darah" Height="245" Width="560"
+        ResizeMode="NoResize" WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Text="File PDF" FontWeight="SemiBold" Margin="0,0,0,6"/>
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBox x:Name="TxtPdfPath" Grid.Column="0" Height="30"
+                     VerticalContentAlignment="Center" Padding="6,0"/>
+            <Button Grid.Column="1" Content="Browse..." Width="82" Height="30"
+                    Margin="8,0,0,0" Click="Browse_Click"/>
+        </Grid>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,16,0,0">
+            <TextBlock Text="Ukuran kertas" FontWeight="SemiBold"
+                       Width="110" VerticalAlignment="Center"/>
+            <ComboBox x:Name="CmbPaper" Width="130" Height="30" SelectedIndex="0">
+                <ComboBoxItem Content="A5" Tag="A5"/>
+                <ComboBoxItem Content="B5" Tag="B5"/>
+            </ComboBox>
+        </StackPanel>
+
+        <TextBlock Grid.Row="3" Margin="0,12,0,0" Foreground="#666"
+                   Text="Printer: WF-C5790 • Tray atas"/>
+
+        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Content="Cetak" Width="92" Height="32" IsDefault="True"
+                    Click="Print_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

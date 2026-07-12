@@ -50,6 +50,43 @@ namespace PaperbellAppDotNet
         public string? Log { get; set; }
     }
 
+    public sealed class PrintingQueueItem : INotifyPropertyChanged
+    {
+        public string Key { get; init; } = "";
+        public int JobId { get; init; }
+        public string PrinterName { get; init; } = "";
+        public string DocumentName { get; init; } = "";
+        public DateTime SubmittedAt { get; init; }
+        public string SubmittedAtText => SubmittedAt.ToString("HH:mm:ss");
+
+        private string _status = "Queued";
+        public string Status
+        {
+            get => _status;
+            set
+            {
+                if (_status == value) return;
+                _status = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(IsCompleted));
+                OnPropertyChanged(nameof(IsActive));
+            }
+        }
+
+        private string _pageProgress = "-";
+        public string PageProgress { get => _pageProgress; set { if (_pageProgress == value) return; _pageProgress = value; OnPropertyChanged(); } }
+
+        private string _orderReference = "-";
+        public string OrderReference { get => _orderReference; set { if (_orderReference == value) return; _orderReference = value; OnPropertyChanged(); } }
+
+        public bool IsCompleted => Status is "Selesai" or "Dibatalkan" or "Error";
+        public bool IsActive => Status is "Queued" or "Spooling" or "Printing" or "Paused";
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+        private void OnPropertyChanged([CallerMemberName] string? name = null) =>
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+    }
+
     /// <summary>One row in <c>product_inventory</c> for the inventory management window.</summary>
     public sealed class InventoryListItem
     {
@@ -339,6 +376,13 @@ namespace PaperbellAppDotNet
         private System.Windows.Threading.DispatcherTimer? _scrollStopTimer;
         private bool _pdfPreviewAvailable = true;
         private bool _pdfPreviewWarningShown = false;
+        private readonly System.Windows.Threading.DispatcherTimer _printingQueueTimer = new();
+        private bool _printingQueuePollBusy;
+        private readonly Dictionary<string, DateTime> _printingQueueLastSeen = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, HashSet<string>> _printingOrderLookup = new(StringComparer.OrdinalIgnoreCase);
+        private DateTime _printingOrderLookupUpdatedAt = DateTime.MinValue;
+
+        public ObservableCollection<PrintingQueueItem> PrintingQueueItems { get; } = new();
 
         private bool _mouseCommitRequested = false;
         private string _typedText = "";
@@ -1100,6 +1144,7 @@ namespace PaperbellAppDotNet
             };
 
             Rows.Add(row);
+            ApplyPrinterOverrideToProductRows();
 
             QueueGrid.SelectedItem = row;
             QueueGrid.ScrollIntoView(row);
@@ -1161,7 +1206,6 @@ namespace PaperbellAppDotNet
             if (_queueGridPreviewDeferredWhileScrolling && QueueGrid.SelectedItem is JobRow row && Rows.Contains(row))
             {
                 _queueGridPreviewDeferredWhileScrolling = false;
-                StartPreviewLatest(row);
             }
         }
 
@@ -1187,6 +1231,68 @@ namespace PaperbellAppDotNet
         private void LoadMap_Click(object sender, RoutedEventArgs e)
         {
             LoadDataMapXlsx_Click(sender, e); // delegasi ke method yang sudah ada
+        }
+
+        private const string DataMappingSpreadsheetId = "1eXwQ_H8ofVroEYlK5X90bvlT66f5a8Q5tnVtTAKNHy4";
+
+        private async void SyncDataMapping_Click(object sender, RoutedEventArgs e)
+        {
+            var originalText = BtnSyncDataMapping.Content;
+            BtnSyncDataMapping.IsEnabled = false;
+            BtnSyncDataMapping.Content = "Syncing...";
+
+            string? tempPath = null;
+            try
+            {
+                Directory.CreateDirectory(ConfigDir);
+                tempPath = Path.Combine(ConfigDir, $"PaperbellDataMap.sync-{Guid.NewGuid():N}.xlsx");
+                var exportUrl =
+                    $"https://docs.google.com/spreadsheets/d/{DataMappingSpreadsheetId}/export?format=xlsx&gid=0";
+
+                using var response = await _shopeeHttp.GetAsync(exportUrl, HttpCompletionOption.ResponseHeadersRead);
+                response.EnsureSuccessStatusCode();
+                var bytes = await response.Content.ReadAsByteArrayAsync();
+
+                // XLSX adalah ZIP dan selalu diawali signature PK. Halaman login Google biasanya HTML.
+                if (bytes.Length < 4 || bytes[0] != 0x50 || bytes[1] != 0x4B)
+                    throw new InvalidOperationException(
+                        "Google Sheets tidak mengembalikan file XLSX. Pastikan akses sheet mengizinkan download melalui link.");
+
+                await File.WriteAllBytesAsync(tempPath, bytes);
+
+                // Validasi struktur/kolom menggunakan loader yang sama sebelum mengganti config aktif.
+                LoadDataMap(tempPath);
+                File.Copy(tempPath, DefaultDataMapPath, overwrite: true);
+                LoadDataMap(DefaultDataMapPath);
+
+                MessageBox.Show(this,
+                    $"Data mapping berhasil disinkronkan.\n\n{DefaultDataMapPath}",
+                    "Sync Data Mapping", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                // Kembalikan mapping dari file lama jika validasi file baru sempat mengubah data in-memory.
+                try
+                {
+                    if (File.Exists(DefaultDataMapPath))
+                        LoadDataMap(DefaultDataMapPath);
+                }
+                catch { }
+
+                MessageBox.Show(this,
+                    "Gagal sync data mapping dari Google Sheets:\n\n" + ex.Message,
+                    "Sync Data Mapping", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                if (!string.IsNullOrWhiteSpace(tempPath))
+                {
+                    try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                }
+
+                BtnSyncDataMapping.Content = originalText;
+                BtnSyncDataMapping.IsEnabled = true;
+            }
         }
 
         // === WRAPPER supaya cocok dengan XAML lama ===
@@ -1273,7 +1379,7 @@ ORDER BY COALESCE(item_name, ''), item_key;";
         public void DbInventoryAddFromMap(DataMapRow map, int addQty)
         {
             if (addQty <= 0) return;
-            var itemKey = KeyModelItem(map.NoRef, map.SKUInduk);
+            var itemKey = NormKey(map.NoRef);
             if (string.IsNullOrEmpty(itemKey)) return;
 
             var ms = (map.NoRef ?? "").Trim();
@@ -2422,7 +2528,7 @@ ORDER BY o.create_time DESC, o.order_sn DESC, op.id ASC;
             if (string.IsNullOrWhiteSpace(row.OrderSn))
                 return;
 
-            var win = new SyncLogWindow { Owner = this };
+            var win = new SyncLogWindow { Owner = this, Title = "TikTok Sync" };
             win.Show();
             await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Background);
 
@@ -2620,6 +2726,7 @@ ORDER BY o.create_time DESC, o.order_sn DESC, op.id ASC;
 
             DeleteTempMergedPdfsForAllRowsInQueue();
             Rows.Clear();
+            _productPrinterBeforeOverride.Clear();
 
             using var con = OpenDb();
             con.Open();
@@ -2661,7 +2768,7 @@ LIMIT $take OFFSET $skip;
                 var ordPrintedOdd = rd.GetOrdinal("printed_odd");
                 var ordPrintedEven = rd.GetOrdinal("printed_even");
 
-                _dataMap.TryGetValue(itemKey, out var map);
+                var map = ResolveDataMapForOrder(itemKey, modelSku, itemSku);
 
                 JobRow row;
                 if (map != null)
@@ -2728,6 +2835,7 @@ LIMIT $take OFFSET $skip;
             }
 
             RefreshOrderFulfillmentOnRows();
+            ApplyPrinterOverrideToProductRows();
             _ = EnsureCustomerInfoForVisibleRowsAsync(Rows.ToList());
             UpdateShopeePagingUi();
             RefreshViews();
@@ -2778,17 +2886,7 @@ LIMIT $take OFFSET $skip;
                     _shopeePageIndex = _pageIndexPrinted;
                     break;
 
-                case 3: // Siap bungkus
-                    _currentTabFilter = ShopeeTabFilter.ReadyToPack;
-                    _shopeePageIndex = _pageIndexReadyToPack;
-                    break;
-
-                case 4: // Sudah dibungkus
-                    _currentTabFilter = ShopeeTabFilter.Packaged;
-                    _shopeePageIndex = _pageIndexPackaged;
-                    break;
-
-                case 5: // Cancel (CANCELLED)
+                case 3: // Cancel (CANCELLED)
                     _currentTabFilter = ShopeeTabFilter.Cancelled;
                     _shopeePageIndex = _pageIndexCancelled;
                     break;
@@ -2828,28 +2926,13 @@ LIMIT $take OFFSET $skip;
 
         private SqliteConnection OpenDb() => new SqliteConnection($"Data Source={DbFilePath}");
 
-private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
+private void MainWindow_Loaded(object sender, RoutedEventArgs e)
 {
     // 1) load state dari DB
     LoadAppStateFromDb();   // pakai yang kamu punya
 
     // 2) update UI dulu (biar tidak blank)
     UpdateShopeeUi();
-
-    // 3) kalau kelihatan "connected", coba validasi cepat
-    if (IsConnected())
-    {
-        var ok = await CheckShopeeSessionAsync();
-        if (!ok)
-        {
-            DisconnectShopee("Sesi Shopee sudah tidak valid. Silakan Connect ulang.");
-        }
-        else
-        {
-            // tetap connected, pastikan UI sesuai
-            Dispatcher.Invoke(UpdateShopeeUi);
-        }
-    }
 
     try
     {
@@ -3700,6 +3783,27 @@ private async Task<List<JsonElement>> GetOrderDetailBatchRawAsync(
             try
             {
                 using var doc = JsonDocument.Parse(rawJson);
+
+                if (doc.RootElement.TryGetProperty("user_id", out var tikTokUserId))
+                {
+                    var userId = JsonElementToString(tikTokUserId).Trim();
+                    var recipientName = "";
+                    if (doc.RootElement.TryGetProperty("recipient_address", out var addr) &&
+                        addr.ValueKind == JsonValueKind.Object &&
+                        addr.TryGetProperty("name", out var nameEl) &&
+                        nameEl.ValueKind == JsonValueKind.String)
+                    {
+                        recipientName = nameEl.GetString()?.Trim() ?? "";
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(recipientName) && !string.IsNullOrWhiteSpace(userId))
+                        return $"{recipientName} ({userId})";
+                    if (!string.IsNullOrWhiteSpace(userId))
+                        return userId;
+                    if (!string.IsNullOrWhiteSpace(recipientName))
+                        return recipientName;
+                }
+
                 if (doc.RootElement.TryGetProperty("buyer_username", out var buyerUsername) &&
                     buyerUsername.ValueKind == JsonValueKind.String)
                 {
@@ -3919,7 +4023,7 @@ ORDER BY create_time DESC;
 
                 if (existing.Contains(id)) continue;
 
-                _dataMap.TryGetValue(itemKey, out var map);
+                var map = ResolveDataMapForOrder(itemKey, modelSku, itemSku);
 
                 JobRow row;
 
@@ -3986,6 +4090,7 @@ ORDER BY create_time DESC;
             foreach (var r in Rows.OrderByDescending(x => x.OrderCreatedAt ?? DateTime.MinValue).ToList())
                 r.Index = idx++;
 
+            ApplyPrinterOverrideToProductRows();
             _ = EnsureCustomerInfoForVisibleRowsAsync(Rows.ToList());
 
             // (optional) kamu bisa MessageBox kalau mau
@@ -4002,6 +4107,793 @@ ORDER BY create_time DESC;
 
         private const string DefaultShopeeBaseUrl = "https://partner.shopeemobile.com";
         private string ShopeeConfigPath => Path.Combine(ConfigDir, "shopee.json");
+        private const string TikTokOrderPrefix = "TIKTOK:";
+        private const string DefaultTikTokBaseUrl = "https://open-api.tiktokglobalshop.com";
+        private string TikTokEnvPath => Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".env.tiktok");
+
+        private static bool IsTikTokOrderSn(string? orderSn) =>
+            (orderSn ?? "").Trim().StartsWith(TikTokOrderPrefix, StringComparison.OrdinalIgnoreCase);
+
+        private static string ToTikTokDbOrderSn(string? orderId)
+        {
+            var id = (orderId ?? "").Trim();
+            if (id.StartsWith(TikTokOrderPrefix, StringComparison.OrdinalIgnoreCase))
+                return id;
+            return TikTokOrderPrefix + id;
+        }
+
+        private static string FromTikTokDbOrderSn(string? orderSn)
+        {
+            var sn = (orderSn ?? "").Trim();
+            return sn.StartsWith(TikTokOrderPrefix, StringComparison.OrdinalIgnoreCase)
+                ? sn[TikTokOrderPrefix.Length..]
+                : sn;
+        }
+
+        private TikTokConfig LoadTikTokConfig()
+        {
+            var cfg = new TikTokConfig();
+            var candidates = new[]
+            {
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".env.tiktok"),
+                Path.Combine(AppContext.BaseDirectory, ".env.tiktok"),
+                Path.Combine(Directory.GetCurrentDirectory(), ".env.tiktok"),
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", ".env.tiktok")
+            }
+            .Select(p => Path.GetFullPath(p))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+            var envPath = candidates.FirstOrDefault(File.Exists);
+            if (string.IsNullOrWhiteSpace(envPath))
+                throw new FileNotFoundException("File .env.tiktok tidak ditemukan di folder aplikasi/project.", TikTokEnvPath);
+
+            foreach (var rawLine in File.ReadAllLines(envPath))
+            {
+                var line = (rawLine ?? "").Trim();
+                if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal))
+                    continue;
+
+                var idx = line.IndexOf('=');
+                if (idx <= 0)
+                    continue;
+
+                var key = line[..idx].Trim();
+                var value = line[(idx + 1)..].Trim().Trim('"');
+
+                switch (key)
+                {
+                    case "TTS_BASE_URL":
+                        cfg.BaseUrl = value;
+                        break;
+                    case "TTS_APP_KEY":
+                        cfg.AppKey = value;
+                        break;
+                    case "TTS_APP_SECRET":
+                        cfg.AppSecret = value;
+                        break;
+                    case "TTS_ACCESS_TOKEN":
+                        cfg.AccessToken = value;
+                        break;
+                    case "TTS_REFRESH_TOKEN":
+                        cfg.RefreshToken = value;
+                        break;
+                    case "TTS_ACCESS_TOKEN_EXPIRES_AT":
+                        long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var accessExpires);
+                        cfg.AccessTokenExpiresAt = accessExpires;
+                        break;
+                    case "TTS_REFRESH_TOKEN_EXPIRES_AT":
+                        long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var refreshExpires);
+                        cfg.RefreshTokenExpiresAt = refreshExpires;
+                        break;
+                    case "TTS_SHOP_ID":
+                        cfg.ShopId = value;
+                        break;
+                    case "TTS_SHOP_CIPHER":
+                        cfg.ShopCipher = value;
+                        break;
+                    case "TTS_ORDER_LIST_PATH":
+                        cfg.OrderListPath = value;
+                        break;
+                    case "TTS_ORDER_DETAIL_PATH":
+                        cfg.OrderDetailPath = value;
+                        break;
+                    case "TTS_TIMEOUT_SECONDS":
+                        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var timeout))
+                            cfg.TimeoutSeconds = timeout;
+                        break;
+                }
+            }
+
+            cfg.EnvPath = envPath;
+            cfg.BaseUrl = string.IsNullOrWhiteSpace(cfg.BaseUrl) ? DefaultTikTokBaseUrl : cfg.BaseUrl.TrimEnd('/');
+            cfg.OrderListPath = string.IsNullOrWhiteSpace(cfg.OrderListPath)
+                ? "/order/202309/orders/search"
+                : cfg.OrderListPath;
+            cfg.OrderDetailPath = string.IsNullOrWhiteSpace(cfg.OrderDetailPath)
+                ? "/order/202507/orders"
+                : cfg.OrderDetailPath;
+
+            var missing = new List<string>();
+            if (string.IsNullOrWhiteSpace(cfg.AppKey)) missing.Add("TTS_APP_KEY");
+            if (string.IsNullOrWhiteSpace(cfg.AppSecret)) missing.Add("TTS_APP_SECRET");
+            if (string.IsNullOrWhiteSpace(cfg.AccessToken)) missing.Add("TTS_ACCESS_TOKEN");
+            if (string.IsNullOrWhiteSpace(cfg.ShopCipher)) missing.Add("TTS_SHOP_CIPHER");
+            if (missing.Count > 0)
+                throw new InvalidOperationException(".env.tiktok belum lengkap: " + string.Join(", ", missing));
+
+            return cfg;
+        }
+
+        private async void TikTokSync_Click(object sender, RoutedEventArgs e)
+        {
+            var win = new SyncLogWindow { Owner = this };
+            win.SetSyncName("TikTok Sync", "Syncing TikTok orders...");
+            win.Show();
+            await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Background);
+
+            IProgress<SyncProgress> progress =
+                new System.Progress<SyncProgress>(p =>
+                {
+                    if (!string.IsNullOrWhiteSpace(p.Log))
+                        win.AppendLog(p.Log);
+                    win.SetProgress(p.Percent, p.Label);
+                });
+
+            try
+            {
+                IsEnabled = false;
+                var cfg = LoadTikTokConfig();
+                var cts = new CancellationTokenSource();
+                win.CancelRequested += () => cts.Cancel();
+
+                await Task.Run(async () =>
+                {
+                    progress.Report(new SyncProgress
+                    {
+                        Percent = 1,
+                        Label = "TikTok",
+                        Log = $"Starting TikTok sync (.env: {Path.GetFileName(cfg.EnvPath)})..."
+                    });
+
+                    if (cfg.AccessTokenExpiresAt <= DateTimeOffset.UtcNow.AddMinutes(5).ToUnixTimeSeconds())
+                        await RefreshTikTokAccessTokenAsync(cfg, progress, cts.Token);
+
+                    using var client = new TikTokShopClient(cfg);
+                    var timeTo = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    var timeFrom = DateTimeOffset.UtcNow.AddDays(-7).ToUnixTimeSeconds();
+                    var orders = await client.SearchOrdersAsync(timeFrom, timeTo, progress, cts.Token);
+
+                    progress.Report(new SyncProgress
+                    {
+                        Percent = 70,
+                        Label = $"{orders.Count} orders",
+                        Log = $"TikTok returned {orders.Count} order(s). Fetching details when available..."
+                    });
+
+                    var byId = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var order in orders)
+                    {
+                        var id = TryGetTikTokOrderId(order);
+                        if (!string.IsNullOrWhiteSpace(id) && !byId.ContainsKey(id))
+                            byId[id] = order;
+                    }
+
+                    try
+                    {
+                        var details = await client.GetOrderDetailsAsync(byId.Keys.ToList(), progress, cts.Token);
+                        foreach (var detail in details)
+                        {
+                            var id = TryGetTikTokOrderId(detail);
+                            if (!string.IsNullOrWhiteSpace(id))
+                                byId[id] = detail;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        progress.Report(new SyncProgress
+                        {
+                            Log = "TikTok detail fetch skipped/fallback to search payload: " + RedactTikTokSensitiveText(ex.Message)
+                        });
+                    }
+
+                    var saved = 0;
+                    var sellerSkuPresent = 0;
+                    var sellerSkuMissing = 0;
+                    foreach (var order in byId.Values)
+                    {
+                        CountTikTokSellerSkuPresence(order, ref sellerSkuPresent, ref sellerSkuMissing);
+                        saved += UpsertTikTokOrderFromJson(order);
+                    }
+
+                    progress.Report(new SyncProgress
+                    {
+                        Percent = 100,
+                        Label = "Done",
+                        Log = $"TikTok sync done. Saved/updated {saved} order(s). seller_sku present={sellerSkuPresent}, empty={sellerSkuMissing}."
+                    });
+                }, cts.Token);
+
+                LoadInventoryCacheFromDb();
+                LoadShopeePageFromDb(0);
+                if (MainWorkspaceTabs?.SelectedIndex == 1)
+                    LoadResiPageFromDb(_resiPageIndex);
+                win.SetDone("TikTok sync completed");
+            }
+            catch (OperationCanceledException)
+            {
+                win.AppendLog("Cancelled by user.");
+                win.SetDone("TikTok sync cancelled");
+            }
+            catch (Exception ex)
+            {
+                win.AppendLog("ERROR: " + RedactTikTokSensitiveText(ex.ToString()));
+                win.SetDone("TikTok sync failed");
+            }
+            finally
+            {
+                IsEnabled = true;
+            }
+        }
+
+        private static async Task RefreshTikTokAccessTokenAsync(
+            TikTokConfig cfg,
+            IProgress<SyncProgress> progress,
+            CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(cfg.RefreshToken))
+                throw new InvalidOperationException(
+                    "TikTok access token sudah kedaluwarsa dan TTS_REFRESH_TOKEN tidak tersedia. Hubungkan ulang toko TikTok.");
+
+            if (cfg.RefreshTokenExpiresAt > 0 &&
+                cfg.RefreshTokenExpiresAt <= DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+                throw new InvalidOperationException("TikTok refresh token juga sudah kedaluwarsa. Hubungkan ulang toko TikTok.");
+
+            progress.Report(new SyncProgress { Log = "[TIKTOK][AUTH] Access token expired; refreshing..." });
+            var query = new Dictionary<string, string>
+            {
+                ["app_key"] = cfg.AppKey,
+                ["app_secret"] = cfg.AppSecret,
+                ["refresh_token"] = cfg.RefreshToken,
+                ["grant_type"] = "refresh_token"
+            };
+            var url = "https://auth.tiktok-shops.com/api/v2/token/refresh?" +
+                      string.Join("&", query.Select(kv =>
+                          $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
+
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+            using var response = await http.GetAsync(url, ct);
+            var text = await response.Content.ReadAsStringAsync(ct);
+            if (!response.IsSuccessStatusCode)
+                throw new InvalidOperationException(
+                    $"TikTok token refresh gagal ({(int)response.StatusCode}): {RedactTikTokSensitiveText(text)}");
+
+            using var doc = JsonDocument.Parse(text);
+            EnsureTikTokOkOrThrow(doc.RootElement);
+            var accessToken = TryFindStringProperty(doc.RootElement, "access_token");
+            var refreshToken = TryFindStringProperty(doc.RootElement, "refresh_token");
+            var accessExpireText = TryFindStringProperty(doc.RootElement, "access_token_expire_in");
+            var refreshExpireText = TryFindStringProperty(doc.RootElement, "refresh_token_expire_in");
+
+            if (string.IsNullOrWhiteSpace(accessToken))
+                throw new InvalidOperationException("Respons refresh TikTok tidak berisi access_token baru.");
+
+            cfg.AccessToken = accessToken;
+            if (!string.IsNullOrWhiteSpace(refreshToken)) cfg.RefreshToken = refreshToken;
+            if (long.TryParse(accessExpireText, out var accessExpire)) cfg.AccessTokenExpiresAt = accessExpire;
+            if (long.TryParse(refreshExpireText, out var refreshExpire)) cfg.RefreshTokenExpiresAt = refreshExpire;
+
+            var updates = new Dictionary<string, string>
+            {
+                ["TTS_ACCESS_TOKEN"] = cfg.AccessToken,
+                ["TTS_REFRESH_TOKEN"] = cfg.RefreshToken,
+                ["TTS_ACCESS_TOKEN_EXPIRES_AT"] = cfg.AccessTokenExpiresAt.ToString(CultureInfo.InvariantCulture),
+                ["TTS_REFRESH_TOKEN_EXPIRES_AT"] = cfg.RefreshTokenExpiresAt.ToString(CultureInfo.InvariantCulture)
+            };
+            var lines = File.ReadAllLines(cfg.EnvPath).ToList();
+            foreach (var update in updates)
+            {
+                var index = lines.FindIndex(line =>
+                    line.TrimStart().StartsWith(update.Key + "=", StringComparison.Ordinal));
+                if (index >= 0) lines[index] = update.Key + "=" + update.Value;
+                else lines.Add(update.Key + "=" + update.Value);
+            }
+            File.WriteAllLines(cfg.EnvPath, lines);
+            progress.Report(new SyncProgress { Log = "[TIKTOK][AUTH] Access token refreshed successfully." });
+        }
+
+        private sealed class TikTokConfig
+        {
+            public string EnvPath { get; set; } = "";
+            public string BaseUrl { get; set; } = DefaultTikTokBaseUrl;
+            public string AppKey { get; set; } = "";
+            public string AppSecret { get; set; } = "";
+            public string AccessToken { get; set; } = "";
+            public string RefreshToken { get; set; } = "";
+            public long AccessTokenExpiresAt { get; set; }
+            public long RefreshTokenExpiresAt { get; set; }
+            public string ShopId { get; set; } = "";
+            public string ShopCipher { get; set; } = "";
+            public string OrderListPath { get; set; } = "/order/202309/orders/search";
+            public string OrderDetailPath { get; set; } = "/order/202507/orders";
+            public int TimeoutSeconds { get; set; } = 30;
+        }
+
+        private sealed class TikTokShopClient : IDisposable
+        {
+            private readonly TikTokConfig _cfg;
+            private readonly HttpClient _http;
+            private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
+
+            public TikTokShopClient(TikTokConfig cfg)
+            {
+                _cfg = cfg;
+                _http = new HttpClient
+                {
+                    BaseAddress = new Uri((_cfg.BaseUrl ?? DefaultTikTokBaseUrl).TrimEnd('/') + "/"),
+                    Timeout = TimeSpan.FromSeconds(Math.Clamp(_cfg.TimeoutSeconds, 5, 180))
+                };
+            }
+
+            public void Dispose() => _http.Dispose();
+
+            private string Sign(string path, SortedDictionary<string, string> query, string body)
+            {
+                var sb = new StringBuilder();
+                sb.Append(path);
+                foreach (var kv in query)
+                {
+                    if (string.Equals(kv.Key, "sign", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(kv.Key, "access_token", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    sb.Append(kv.Key);
+                    sb.Append(kv.Value);
+                }
+
+                if (!string.IsNullOrEmpty(body))
+                    sb.Append(body);
+
+                var signSource = _cfg.AppSecret + sb + _cfg.AppSecret;
+                using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_cfg.AppSecret));
+                var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(signSource));
+                return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+            }
+
+            private async Task<JsonDocument> SendJsonAsync(
+                HttpMethod method,
+                string path,
+                IDictionary<string, string?> query,
+                object? body,
+                IProgress<SyncProgress> progress,
+                CancellationToken ct)
+            {
+                var cleanPath = "/" + (path ?? "").TrimStart('/');
+                var q = new SortedDictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["app_key"] = _cfg.AppKey,
+                    ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture)
+                };
+
+                if (!string.IsNullOrWhiteSpace(_cfg.ShopCipher))
+                    q["shop_cipher"] = _cfg.ShopCipher;
+
+                foreach (var kv in query)
+                {
+                    if (!string.IsNullOrWhiteSpace(kv.Value))
+                        q[kv.Key] = kv.Value!;
+                }
+
+                var bodyText = body == null ? "" : JsonSerializer.Serialize(body, _jsonOptions);
+                q["sign"] = Sign(cleanPath, q, bodyText);
+                var qs = string.Join("&", q.Select(kv =>
+                    $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
+                var url = cleanPath.TrimStart('/') + "?" + qs;
+
+                using var req = new HttpRequestMessage(method, url);
+                req.Headers.TryAddWithoutValidation("x-tts-access-token", _cfg.AccessToken);
+                if (body != null)
+                    req.Content = new StringContent(bodyText, Encoding.UTF8, "application/json");
+
+                progress.Report(new SyncProgress { Log = $"[TIKTOK][REQ] {method.Method} {cleanPath}" });
+                using var resp = await _http.SendAsync(req, ct);
+                var text = await resp.Content.ReadAsStringAsync(ct);
+                var shortText = text.Length > 500 ? text[..500] + "..." : text;
+                progress.Report(new SyncProgress
+                {
+                    Log = $"[TIKTOK][RESP] {(int)resp.StatusCode} {resp.ReasonPhrase} | {RedactTikTokSensitiveText(shortText)}"
+                });
+
+                if (!resp.IsSuccessStatusCode)
+                    throw new HttpRequestException($"TikTok HTTP {(int)resp.StatusCode} {resp.ReasonPhrase}: {RedactTikTokSensitiveText(text)}");
+
+                var doc = JsonDocument.Parse(text);
+                EnsureTikTokOkOrThrow(doc.RootElement);
+                return doc;
+            }
+
+            public async Task<List<JsonElement>> SearchOrdersAsync(
+                long timeFrom,
+                long timeTo,
+                IProgress<SyncProgress> progress,
+                CancellationToken ct)
+            {
+                var result = new List<JsonElement>();
+                string? pageToken = null;
+                var page = 0;
+
+                do
+                {
+                    page++;
+                    var query = new Dictionary<string, string?>
+                    {
+                        ["page_size"] = "50",
+                        ["page_token"] = pageToken,
+                        ["sort_field"] = "update_time",
+                        ["sort_order"] = "DESC"
+                    };
+
+                    var body = new Dictionary<string, object?>
+                    {
+                        ["update_time_ge"] = timeFrom,
+                        ["update_time_lt"] = timeTo
+                    };
+
+                    progress.Report(new SyncProgress
+                    {
+                        Percent = Math.Min(65, page * 10),
+                        Label = $"TikTok page {page}",
+                        Log = $"TikTok order search page {page}..."
+                    });
+
+                    using var doc = await SendJsonAsync(HttpMethod.Post, _cfg.OrderListPath, query, body, progress, ct);
+                    if (TryFindJsonArray(doc.RootElement, "orders", out var orders))
+                    {
+                        foreach (var order in orders.EnumerateArray())
+                            result.Add(order.Clone());
+                    }
+
+                    pageToken = TryFindStringProperty(doc.RootElement, "next_page_token");
+                    if (string.IsNullOrWhiteSpace(pageToken))
+                        pageToken = TryFindStringProperty(doc.RootElement, "next_page");
+
+                    await Task.Delay(150, ct);
+                }
+                while (!string.IsNullOrWhiteSpace(pageToken));
+
+                return result;
+            }
+
+            public async Task<List<JsonElement>> GetOrderDetailsAsync(
+                IReadOnlyList<string> orderIds,
+                IProgress<SyncProgress> progress,
+                CancellationToken ct)
+            {
+                var result = new List<JsonElement>();
+                var ids = orderIds
+                    .Where(s => !string.IsNullOrWhiteSpace(s))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                if (ids.Count == 0)
+                    return result;
+
+                const int batchSize = 50;
+                for (var i = 0; i < ids.Count; i += batchSize)
+                {
+                    var batch = ids.Skip(i).Take(batchSize).ToList();
+                    var query = new Dictionary<string, string?>
+                    {
+                        ["ids"] = string.Join(",", batch)
+                    };
+
+                    using var doc = await SendJsonAsync(HttpMethod.Get, _cfg.OrderDetailPath, query, null, progress, ct);
+                    if (TryFindJsonArray(doc.RootElement, "orders", out var orders))
+                    {
+                        foreach (var order in orders.EnumerateArray())
+                            result.Add(order.Clone());
+                    }
+                }
+
+                return result;
+            }
+
+            public async Task<byte[]> DownloadTikTokLabelPdfAsync(
+                string orderId,
+                string? packageId,
+                IProgress<SyncProgress> progress,
+                CancellationToken ct)
+            {
+                if (string.IsNullOrWhiteSpace(packageId))
+                    throw new InvalidOperationException(
+                        "Package ID TikTok tidak ditemukan di data order. Jalankan TikTok Sync ulang, lalu coba lagi.");
+
+                var path = $"/fulfillment/202309/packages/{Uri.EscapeDataString(packageId)}/shipping_documents";
+                JsonDocument doc;
+                try
+                {
+                    // Prefer TikTok's combined PDF: shipping label followed by its packing slip.
+                    // Some carriers/orders do not provide a packing slip, so retain the old label-only
+                    // request as a compatibility fallback.
+                    doc = await SendJsonAsync(
+                        HttpMethod.Get,
+                        path,
+                        new Dictionary<string, string?>
+                        {
+                            ["document_type"] = "SHIPPING_LABEL_AND_PACKING_SLIP"
+                        },
+                        null,
+                        progress,
+                        ct);
+                }
+                catch (Exception ex) when ((ex.Message ?? "").Contains("Documents couldn't be printed after the package has been pickup", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        "TikTok menolak cetak ulang label karena paket sudah pickup/diambil kurir. " +
+                        "Coba ambil label untuk order yang belum pickup, atau cetak ulang dari Seller Centre jika tersedia.",
+                        ex);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    progress.Report(new SyncProgress
+                    {
+                        Log = "[TIKTOK] Packing slip tidak tersedia; mencoba shipping label saja. " +
+                              RedactTikTokSensitiveText(ex.Message)
+                    });
+                    doc = await SendJsonAsync(
+                        HttpMethod.Get,
+                        path,
+                        new Dictionary<string, string?>
+                        {
+                            ["document_type"] = "SHIPPING_LABEL"
+                        },
+                        null,
+                        progress,
+                        ct);
+                }
+
+                using (doc)
+                {
+                    if (TryFindStringProperty(doc.RootElement, "file_base64") is { Length: > 0 } b64)
+                        return Convert.FromBase64String(b64);
+
+                    var url = TryFindFirstStringProperty(doc.RootElement,
+                        "doc_url", "download_url", "file_url", "document_url", "shipping_document_url", "url");
+                    if (!string.IsNullOrWhiteSpace(url))
+                    {
+                        progress.Report(new SyncProgress { Log = "[TIKTOK][REQ] GET shipping label file" });
+                        return await _http.GetByteArrayAsync(url, ct);
+                    }
+                }
+
+                throw new InvalidOperationException(
+                    "Respons TikTok untuk label tidak berisi doc_url atau file_base64.");
+            }
+        }
+
+        private static void EnsureTikTokOkOrThrow(JsonElement root)
+        {
+            var codeText = TryFindStringProperty(root, "code");
+            if (string.IsNullOrWhiteSpace(codeText) && root.TryGetProperty("code", out var codeEl))
+                codeText = codeEl.GetRawText().Trim('"');
+
+            if (!string.IsNullOrWhiteSpace(codeText) &&
+                codeText != "0" &&
+                !codeText.Equals("success", StringComparison.OrdinalIgnoreCase))
+            {
+                var msg = TryFindFirstStringProperty(root, "message", "msg", "error_message") ?? "";
+                throw new InvalidOperationException($"TikTok API error {codeText}: {msg}");
+            }
+        }
+
+        private static string RedactTikTokSensitiveText(string? text)
+        {
+            var s = text ?? "";
+            foreach (var key in new[] { "access_token", "refresh_token", "app_secret", "sign", "x-tts-access-token" })
+            {
+                s = Regex.Replace(
+                    s,
+                    $"({Regex.Escape(key)}[\"'=:\\s]+)([^\"'&,\\s}}]+)",
+                    "$1***",
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            }
+            return s;
+        }
+
+        private static bool TryFindJsonArray(JsonElement root, string propertyName, out JsonElement value)
+        {
+            if (root.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var prop in root.EnumerateObject())
+                {
+                    if (string.Equals(prop.Name, propertyName, StringComparison.OrdinalIgnoreCase) &&
+                        prop.Value.ValueKind == JsonValueKind.Array)
+                    {
+                        value = prop.Value;
+                        return true;
+                    }
+
+                    if (TryFindJsonArray(prop.Value, propertyName, out value))
+                        return true;
+                }
+            }
+            else if (root.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in root.EnumerateArray())
+                {
+                    if (TryFindJsonArray(item, propertyName, out value))
+                        return true;
+                }
+            }
+
+            value = default;
+            return false;
+        }
+
+        private static string? TryFindStringProperty(JsonElement root, string propertyName)
+        {
+            if (root.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var prop in root.EnumerateObject())
+                {
+                    if (string.Equals(prop.Name, propertyName, StringComparison.OrdinalIgnoreCase))
+                        return JsonElementToString(prop.Value);
+                    var nested = TryFindStringProperty(prop.Value, propertyName);
+                    if (!string.IsNullOrWhiteSpace(nested))
+                        return nested;
+                }
+            }
+            else if (root.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in root.EnumerateArray())
+                {
+                    var nested = TryFindStringProperty(item, propertyName);
+                    if (!string.IsNullOrWhiteSpace(nested))
+                        return nested;
+                }
+            }
+
+            return null;
+        }
+
+        private static string? TryFindFirstStringProperty(JsonElement root, params string[] propertyNames)
+        {
+            foreach (var name in propertyNames)
+            {
+                var value = TryFindStringProperty(root, name);
+                if (!string.IsNullOrWhiteSpace(value))
+                    return value;
+            }
+            return null;
+        }
+
+        private static string JsonElementToString(JsonElement value)
+        {
+            return value.ValueKind switch
+            {
+                JsonValueKind.String => value.GetString() ?? "",
+                JsonValueKind.Number => value.GetRawText(),
+                JsonValueKind.True => "true",
+                JsonValueKind.False => "false",
+                _ => ""
+            };
+        }
+
+        private static long TryFindUnixTime(JsonElement root, params string[] names)
+        {
+            foreach (var name in names)
+            {
+                var raw = TryFindStringProperty(root, name);
+                if (long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v))
+                    return v;
+            }
+            return 0;
+        }
+
+        private static string TryGetTikTokOrderId(JsonElement order) =>
+            TryFindFirstStringProperty(order, "id", "order_id", "orderId") ?? "";
+
+        private static string TryGetTikTokStatus(JsonElement order) =>
+            TryFindFirstStringProperty(order, "status", "order_status", "orderStatus") ?? "";
+
+        private static int TryFindTikTokQty(JsonElement line)
+        {
+            foreach (var name in new[] { "quantity", "qty", "sku_quantity", "product_count" })
+            {
+                var raw = TryFindStringProperty(line, name);
+                if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var q) && q > 0)
+                    return q;
+            }
+            return 1;
+        }
+
+        private static bool TryFindTikTokLineItems(JsonElement order, out JsonElement lines)
+        {
+            foreach (var name in new[] { "line_items", "line_item_list", "order_line_items", "item_list", "items" })
+            {
+                if (TryFindJsonArray(order, name, out lines))
+                    return true;
+            }
+            lines = default;
+            return false;
+        }
+
+        private static void CountTikTokSellerSkuPresence(JsonElement order, ref int present, ref int missing)
+        {
+            if (!TryFindTikTokLineItems(order, out var lines) || lines.ValueKind != JsonValueKind.Array)
+                return;
+
+            foreach (var line in lines.EnumerateArray())
+            {
+                var sellerSku = TryFindFirstStringProperty(line, "seller_sku", "sellerSku");
+                if (string.IsNullOrWhiteSpace(sellerSku))
+                    missing++;
+                else
+                    present++;
+            }
+        }
+
+        private string ResolveTikTokItemKey(string modelSku, string itemSku, params string[] fallbacks)
+        {
+            var candidates = new List<string>();
+            if (!string.IsNullOrWhiteSpace(modelSku) || !string.IsNullOrWhiteSpace(itemSku))
+                candidates.Add(KeyModelItem(modelSku, itemSku));
+
+            foreach (var sku in fallbacks.Concat(new[] { itemSku, modelSku }))
+            {
+                if (string.IsNullOrWhiteSpace(sku))
+                    continue;
+                candidates.Add(KeyModelItem("", sku));
+                candidates.Add(KeySkuIndukOnly(sku));
+                candidates.Add(KeyRefOnly(sku));
+            }
+
+            foreach (var key in candidates.Where(k => !string.IsNullOrWhiteSpace(k)).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (_dataMap.ContainsKey(key))
+                    return key;
+            }
+
+            return candidates.FirstOrDefault(k => !string.IsNullOrWhiteSpace(k)) ?? "";
+        }
+
+        private int UpsertTikTokOrderFromJson(JsonElement order)
+        {
+            var orderId = TryGetTikTokOrderId(order);
+            if (string.IsNullOrWhiteSpace(orderId))
+                return 0;
+
+            var dbOrderSn = ToTikTokDbOrderSn(orderId);
+            var status = TryGetTikTokStatus(order);
+            var createTime = TryFindUnixTime(order, "create_time", "createTime", "created_time", "created_at");
+            var updateTime = TryFindUnixTime(order, "update_time", "updateTime", "updated_time", "updated_at");
+            UpsertOrderRaw(dbOrderSn, status, createTime, updateTime, order.GetRawText());
+
+            if (!TryFindTikTokLineItems(order, out var lines) || lines.ValueKind != JsonValueKind.Array)
+                return 1;
+
+            var lineIds = new List<string>();
+            var lineIndex = 0;
+            foreach (var line in lines.EnumerateArray())
+            {
+                var lineId = TryFindFirstStringProperty(line, "id", "line_item_id", "order_line_id", "sku_id") ??
+                             $"line:{lineIndex}";
+                lineIndex++;
+                lineIds.Add(lineId);
+
+                var sellerSku = TryFindFirstStringProperty(line, "seller_sku", "sku", "sku_code", "outer_sku_id") ?? "";
+                var skuId = TryFindFirstStringProperty(line, "sku_id", "product_sku_id") ?? "";
+                var productId = TryFindFirstStringProperty(line, "product_id", "item_id") ?? "";
+                var itemName = TryFindFirstStringProperty(line, "product_name", "item_name", "name") ?? "";
+                var modelName = TryFindFirstStringProperty(line, "sku_name", "variation_name", "model_name") ?? "";
+                var qty = TryFindTikTokQty(line);
+                var itemKey = ResolveTikTokItemKey("", sellerSku, skuId, productId);
+                InsertOrderProcess(dbOrderSn, lineId, itemKey, "", sellerSku, itemName, modelName, qty, status, createTime);
+            }
+
+            if (lineIds.Count > 0)
+                DeleteOrderProcessLinesNotIn(dbOrderSn, lineIds);
+
+            return 1;
+        }
 
         private async Task SyncShopeeToDbAsync(IProgress<SyncProgress> progress)
         {
@@ -4143,7 +5035,7 @@ ORDER BY create_time DESC;
                 return;
             }
 
-            var win = new SyncLogWindow { Owner = this };
+            var win = new SyncLogWindow { Owner = this, Title = "Shopee Sync" };
             win.Show();
             await this.Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Background);
 
@@ -5553,10 +6445,10 @@ LIMIT $take OFFSET $skip;";
             if (!IsLoaded || !ReferenceEquals(e.OriginalSource, MainWorkspaceTabs))
                 return;
 
-            UpdatePreviewChromeForActiveTab();
-
             if (MainWorkspaceTabs.SelectedIndex == 1)
             {
+                PrintingQueuePanel.Visibility = Visibility.Collapsed;
+                PdfPreviewPanel.Visibility = Visibility.Visible;
                 LoadResiPageFromDb(_resiPageIndex);
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
@@ -5565,13 +6457,8 @@ LIMIT $take OFFSET $skip;";
             }
             else
             {
-                TxtPreviewHint.Visibility = Visibility.Collapsed;
-                if (MainWorkspaceTabs.SelectedIndex == 0 && QueueGrid.SelectedItem is JobRow jr)
-                {
-                    _lastUserPickedForPreview = jr;
-                    if (!_suppressPreviewWhileScrolling)
-                        StartPreviewLatest(jr);
-                }
+                PdfPreviewPanel.Visibility = Visibility.Collapsed;
+                PrintingQueuePanel.Visibility = Visibility.Visible;
             }
         }
 
@@ -5795,7 +6682,6 @@ LIMIT $take OFFSET $skip;";
             e.Handled = true;
             if (MainWorkspaceTabs.SelectedIndex != 1)
                 return;
-            // Saat multi-select, pratinjau mengikuti fokus utama (baris terakhir dipilih).
             ResiSynchronizePreviewForRow(ResiGrid.SelectedItem as ResiRow);
         }
 
@@ -5837,6 +6723,91 @@ LIMIT $take OFFSET $skip;";
                    "• Tunggu 1–2 menit setelah arrange / resi muncul di kurir, lalu Shopee Sync + coba lagi.";
         }
 
+        private string GetOrderRawJson(string orderSn)
+        {
+            using var con = OpenDb();
+            con.Open();
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = "SELECT raw_json FROM orders WHERE order_sn = $sn LIMIT 1;";
+            cmd.Parameters.AddWithValue("$sn", orderSn ?? "");
+            return cmd.ExecuteScalar() as string ?? "";
+        }
+
+        private static string? TryExtractTikTokPackageId(JsonElement order)
+        {
+            var direct = TryFindFirstStringProperty(order, "package_id", "packageId", "package_number", "packageNumber");
+            if (!string.IsNullOrWhiteSpace(direct))
+                return direct;
+
+            foreach (var arrayName in new[] { "packages", "package_list" })
+            {
+                if (!TryFindJsonArray(order, arrayName, out var packages) || packages.ValueKind != JsonValueKind.Array)
+                    continue;
+                foreach (var pkg in packages.EnumerateArray())
+                {
+                    var id = TryFindFirstStringProperty(pkg, "id", "package_id", "packageId", "package_number", "packageNumber");
+                    if (!string.IsNullOrWhiteSpace(id))
+                        return id;
+                }
+            }
+
+            return null;
+        }
+
+        private async Task<string> DownloadTikTokResiPdfAsync(
+            string dbOrderSn,
+            IProgress<SyncProgress> progress,
+            CancellationToken ct)
+        {
+            var orderId = FromTikTokDbOrderSn(dbOrderSn);
+            var rawJson = GetOrderRawJson(dbOrderSn);
+            if (string.IsNullOrWhiteSpace(rawJson))
+                throw new InvalidOperationException("Raw JSON TikTok belum tersimpan. Jalankan TikTok Sync dulu.");
+
+            string? packageId = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(rawJson);
+                packageId = TryExtractTikTokPackageId(doc.RootElement);
+            }
+            catch { }
+
+            Directory.CreateDirectory(ResiStorageDir);
+            var outPath = Path.Combine(ResiStorageDir, $"{dbOrderSn.Replace(':', '_')}_resi.pdf");
+            var cfg = LoadTikTokConfig();
+            using var client = new TikTokShopClient(cfg);
+            var bytes = await client.DownloadTikTokLabelPdfAsync(orderId, packageId, progress, ct);
+            await File.WriteAllBytesAsync(outPath, bytes, ct);
+            return outPath;
+        }
+
+        private bool CanFetchLabelForOrder(string orderSn, out string message)
+        {
+            if (IsTikTokOrderSn(orderSn))
+            {
+                try
+                {
+                    _ = LoadTikTokConfig();
+                    message = "";
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    message = "Konfigurasi TikTok belum siap:\n" + ex.Message;
+                    return false;
+                }
+            }
+
+            if (!IsConnected())
+            {
+                message = "Hubungkan Shopee dulu (Connect Shopee).";
+                return false;
+            }
+
+            message = "";
+            return true;
+        }
+
         private async Task<(bool Ok, string? Error, string? Path)> FetchResiPdfCoreAsync(
             ResiRow row,
             IProgress<SyncProgress> progress,
@@ -5844,7 +6815,9 @@ LIMIT $take OFFSET $skip;";
         {
             try
             {
-                var path = await DownloadShopeeResiPdfAsync(row.OrderSn, progress, ct, logFullRequestResponse: true);
+                var path = IsTikTokOrderSn(row.OrderSn)
+                    ? await DownloadTikTokResiPdfAsync(row.OrderSn, progress, ct)
+                    : await DownloadShopeeResiPdfAsync(row.OrderSn, progress, ct, logFullRequestResponse: true);
                 DbUpsertOrderResiPdf(row.OrderSn, path);
                 return (true, null, path);
             }
@@ -5856,9 +6829,9 @@ LIMIT $take OFFSET $skip;";
 
         private async Task FetchResiForRowAsync(ResiRow row, bool showSuccessDialog)
         {
-            if (!IsConnected())
+            if (!CanFetchLabelForOrder(row.OrderSn, out var authMessage))
             {
-                MessageBox.Show("Hubungkan Shopee dulu (Connect Shopee).", "Label pengiriman", MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show(authMessage, "Label pengiriman", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
@@ -5881,7 +6854,6 @@ LIMIT $take OFFSET $skip;";
                     {
                         ResiGrid.SelectedItem = refreshed;
                         ResiGridSyncCurrentCell(refreshed);
-                        ResiSynchronizePreviewForRow(refreshed);
                     }
                 }
                 else
@@ -5903,10 +6875,13 @@ LIMIT $take OFFSET $skip;";
 
         private async Task FetchResiManyAsync(IReadOnlyList<ResiRow> rows)
         {
-            if (!IsConnected())
+            foreach (var row in rows)
             {
-                MessageBox.Show("Hubungkan Shopee dulu (Connect Shopee).", "Label pengiriman", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
+                if (!CanFetchLabelForOrder(row.OrderSn, out var authMessage))
+                {
+                    MessageBox.Show(authMessage, "Label pengiriman", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
             }
 
             var total = rows.Count;
@@ -5958,7 +6933,6 @@ LIMIT $take OFFSET $skip;";
                 }
 
                 LoadResiPageFromDb(_resiPageIndex);
-                ResiSynchronizePreviewForRow(ResiGrid.SelectedItem as ResiRow);
 
                 var summary = $"Selesai mengunduh {rows.Count} order.\nBerhasil: {ok}\nGagal: {failed.Count}";
                 if (failed.Count > 0)
@@ -6049,6 +7023,7 @@ LIMIT $take OFFSET $skip;";
                 Paper = PaperPreset.A6,
                 PrintMonochrome = true,
                 PrintFromTopLeft = true,
+                ForceUpperTray = true,
                 OrderProcessId = 0,
                 Status = "Ready",
                 PdfPrintScale = pdfPrintScale
@@ -6170,7 +7145,6 @@ LIMIT $take OFFSET $skip;";
                 }
 
                 LoadResiPageFromDb(_resiPageIndex);
-                ResiSynchronizePreviewForRow(ResiGrid.SelectedItem as ResiRow);
 
                 if (failed.Count > 0)
                     LogPrint("Cetak label — gagal: " + string.Join("; ", failed));
@@ -6537,6 +7511,26 @@ private static string NormKey(string? s)
 private static string KeyModelItem(string? modelSku, string? itemSku)
     => NormKey(modelSku) + NormKey(itemSku);
 
+        private DataMapRow? ResolveDataMapForOrder(string? itemKey, string? modelSku = null, string? itemSku = null)
+        {
+            var candidates = new[]
+            {
+                NormKey(itemKey),
+                KeyModelItem(modelSku, itemSku),
+                KeyModelItem(itemSku, modelSku),
+                NormKey(modelSku),
+                NormKey(itemSku)
+            };
+
+            foreach (var key in candidates.Where(key => !string.IsNullOrWhiteSpace(key)).Distinct())
+            {
+                if (_dataMap.TryGetValue(key, out var map))
+                    return map;
+            }
+
+            return null;
+        }
+
         private static string GetShopeeModelSku(JsonElement it)
         {
             if (it.TryGetProperty("model_sku", out var msku))
@@ -6644,6 +7638,11 @@ public MainWindow()
             if (PackGrid != null)
                 PackGrid.ItemsSource = PackRows;
             DataContext = this;
+            _printingQueueTimer.Interval = TimeSpan.FromMilliseconds(750);
+            _printingQueueTimer.Tick += async (_, _) => await RefreshPrintingQueueAsync();
+            _printingQueueTimer.Start();
+            Closed += (_, _) => _printingQueueTimer.Stop();
+            _ = RefreshPrintingQueueAsync();
             UpdateProductTabPanelsVisibility();
             Paperbell_App.App.Trace("MainWindow ctor: RefreshPrinters");
             RefreshPrinters();
@@ -7141,14 +8140,52 @@ public MainWindow()
             {
                 _lastUserPickedForPreview = row;
                 row.Status = "Ready";
+                _queueGridPreviewDeferredWhileScrolling = false;
+            }
+        }
 
-                if (!_suppressPreviewWhileScrolling)
+        private void OpenPdfFile_Click(object sender, RoutedEventArgs e)
+        {
+            if ((sender as FrameworkElement)?.DataContext is not JobRow row ||
+                string.IsNullOrWhiteSpace(row.File) || !File.Exists(row.File))
+            {
+                MessageBox.Show(this, "File PDF tidak ditemukan.", "Buka PDF",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            try
+            {
+                var chromeCandidates = new[]
                 {
-                    _queueGridPreviewDeferredWhileScrolling = false;
-                    StartPreviewLatest(row);
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                        "Google", "Chrome", "Application", "chrome.exe"),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                        "Google", "Chrome", "Application", "chrome.exe"),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        "Google", "Chrome", "Application", "chrome.exe")
+                };
+                var chrome = chromeCandidates.FirstOrDefault(File.Exists);
+                var fileUrl = new Uri(Path.GetFullPath(row.File)).AbsoluteUri;
+
+                if (chrome != null)
+                {
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = chrome,
+                        Arguments = $"--new-tab \"{fileUrl}\"",
+                        UseShellExecute = true
+                    });
                 }
                 else
-                    _queueGridPreviewDeferredWhileScrolling = true;
+                {
+                    Process.Start(new ProcessStartInfo { FileName = fileUrl, UseShellExecute = true });
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Gagal membuka PDF:\n" + ex.Message, "Buka PDF",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
@@ -7454,7 +8491,76 @@ public MainWindow()
                 await PrintAsync(r);
         }
 
-        private static string BuildSumatraPrintSettings(JobRow r)
+        private async void CuciDarah_Click(object sender, RoutedEventArgs e)
+        {
+            var dialog = new CuciDarahPrintDialog { Owner = this };
+            if (dialog.ShowDialog() != true)
+                return;
+
+            var pdfPath = dialog.PdfPath;
+            var paperName = dialog.PaperName;
+            var printSettings = $"1,noscale,simplex,bin=261,paper={paperName}";
+
+            var sumatra = TryFindSumatra();
+            if (sumatra == null)
+            {
+                MessageBox.Show(this, "SumatraPDF tidak ditemukan.", "Cuci Darah",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            var printer = PrinterSettings.InstalledPrinters
+                .Cast<string>()
+                .FirstOrDefault(name =>
+                    name.Contains("WF-C5790", StringComparison.OrdinalIgnoreCase) &&
+                    !name.Contains("Fax", StringComparison.OrdinalIgnoreCase));
+
+            if (printer == null)
+            {
+                MessageBox.Show(this, "Printer WF-C5790 tidak ditemukan.", "Cuci Darah",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            BtnCuciDarah.IsEnabled = false;
+            BtnCuciDarah.Content = "Mencetak...";
+
+            try
+            {
+                var args = $"-print-to \"{printer}\" -print-settings \"{printSettings}\" -silent \"{pdfPath}\"";
+                LogPrint($"CUCI DARAH: Sumatra='{sumatra}' Printer='{printer}' Settings='{printSettings}' File='{pdfPath}'");
+
+                using var process = Process.Start(new ProcessStartInfo
+                {
+                    FileName = sumatra,
+                    Arguments = args,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                });
+
+                if (process == null)
+                    throw new InvalidOperationException("SumatraPDF gagal dijalankan.");
+
+                await process.WaitForExitAsync();
+                if (process.ExitCode != 0)
+                    throw new InvalidOperationException($"SumatraPDF selesai dengan exit code {process.ExitCode}.");
+
+                LogPrint("CUCI DARAH: Dokumen berhasil dikirim ke printer.");
+            }
+            catch (Exception ex)
+            {
+                LogPrint("CUCI DARAH ERROR: " + ex);
+                MessageBox.Show(this, "Gagal mencetak PINK.pdf:\n" + ex.Message, "Cuci Darah",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                BtnCuciDarah.Content = "Cuci Darah";
+                BtnCuciDarah.IsEnabled = true;
+            }
+        }
+
+        private static string BuildSumatraPrintSettings(JobRow r, string printerName)
         {
             // Range
             int from = Math.Max(1, r.PageFrom);
@@ -7486,6 +8592,14 @@ public MainWindow()
             string copiesPart = copies > 1 ? $"{copies}x" : "";
 
             var parts = new List<string> { range, duplex, scaling };
+            // Label pengiriman untuk Brother DCP / Epson WF selalu lewat tray atas.
+            if (r.ForceUpperTray && printerName.Contains("Brother DCP", StringComparison.OrdinalIgnoreCase))
+                parts.Add("bin=258"); // MP Tray
+            else if (r.ForceUpperTray && printerName.Contains("WF", StringComparison.OrdinalIgnoreCase))
+                parts.Add("bin=261"); // Rear Paper Feed
+            // Cetak biasa di WF-C5790 tetap lewat Paper Cassette 1 (tray bawah).
+            else if (printerName.Contains("WF-C5790", StringComparison.OrdinalIgnoreCase))
+                parts.Add("bin=258");
             if (r.PrintMonochrome)
                 parts.Add("monochrome");
             if (!string.IsNullOrWhiteSpace(paper)) parts.Add(paper);
@@ -7573,6 +8687,27 @@ public MainWindow()
                 DuplexMode.DuplexShortEdge => Duplex.Horizontal,
                 _ => Duplex.Simplex
             };
+            if (r.ForceUpperTray &&
+                (printerName.Contains("Brother DCP", StringComparison.OrdinalIgnoreCase) ||
+                 printerName.Contains("WF", StringComparison.OrdinalIgnoreCase)))
+            {
+                var expectedRawKind = printerName.Contains("Brother DCP", StringComparison.OrdinalIgnoreCase)
+                    ? 258 // MP Tray
+                    : 261; // Rear Paper Feed
+                var upperTray = pd.PrinterSettings.PaperSources
+                    .Cast<PaperSource>()
+                    .FirstOrDefault(source => source.RawKind == expectedRawKind);
+                if (upperTray != null)
+                    pd.DefaultPageSettings.PaperSource = upperTray;
+            }
+            else if (printerName.Contains("WF-C5790", StringComparison.OrdinalIgnoreCase))
+            {
+                var lowerTray = pd.PrinterSettings.PaperSources
+                    .Cast<PaperSource>()
+                    .FirstOrDefault(source => source.RawKind == 258);
+                if (lowerTray != null)
+                    pd.DefaultPageSettings.PaperSource = lowerTray;
+            }
             TryApplyJobRowPaperAndColor(pd, r);
             // Kurangi margin lunak Windows supaya (0,0) mendekati tepi kiri atas kertas/driver.
             pd.DefaultPageSettings.Margins = new Margins(0, 0, 0, 0);
@@ -7866,7 +9001,7 @@ public MainWindow()
                 // Print via SumatraPDF
                 await Task.Run(() =>
                 {
-                    var printSettings = BuildSumatraPrintSettings(r);
+                    var printSettings = BuildSumatraPrintSettings(r, pname);
                     if (r.PrintSide != PrintSideMode.All)
                     {
                         var selectedRange = BuildPageRangeForSelectedSide(r);
@@ -8026,6 +9161,7 @@ public MainWindow()
 
             string[] candidates =
             {
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SumatraPDF", "SumatraPDF.exe"),
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "SumatraPDF", "SumatraPDF.exe"),
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "SumatraPDF", "SumatraPDF.exe"),
             };
@@ -8036,6 +9172,296 @@ public MainWindow()
         // =====================
         // Progress monitoring (Windows spooler, best-effort)
         // =====================
+
+        private sealed record SpoolerJobSnapshot(
+            string Key, int JobId, string PrinterName, string DocumentName,
+            DateTime SubmittedAt, string Status, string PageProgress);
+
+        private static string GetSpoolerStatus(PrintJobStatus status)
+        {
+            if (status.HasFlag(PrintJobStatus.Deleted) || status.HasFlag(PrintJobStatus.Deleting)) return "Dibatalkan";
+            if (status.HasFlag(PrintJobStatus.Error) || status.HasFlag(PrintJobStatus.PaperOut) ||
+                status.HasFlag(PrintJobStatus.Offline) || status.HasFlag(PrintJobStatus.Blocked)) return "Error";
+            if (status.HasFlag(PrintJobStatus.Completed) || status.HasFlag(PrintJobStatus.Printed)) return "Selesai";
+            if (status.HasFlag(PrintJobStatus.Printing)) return "Printing";
+            if (status.HasFlag(PrintJobStatus.Paused)) return "Paused";
+            if (status.HasFlag(PrintJobStatus.Spooling)) return "Spooling";
+            return "Queued";
+        }
+
+        private string FindOrderReferenceForPrintDocument(string documentName)
+        {
+            if (string.IsNullOrWhiteSpace(documentName))
+                return "-";
+
+            static bool SamePrintFile(string? configuredPath, string spoolerDocument)
+            {
+                if (string.IsNullOrWhiteSpace(configuredPath))
+                    return false;
+
+                var configured = configuredPath.Trim().Trim('"');
+                var spooler = spoolerDocument.Trim().Trim('"');
+                if (string.Equals(configured, spooler, StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+                try
+                {
+                    return string.Equals(Path.GetFileName(configured), Path.GetFileName(spooler),
+                        StringComparison.OrdinalIgnoreCase);
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            var orders = Rows
+                .Where(row => SamePrintFile(row.File, documentName) && !string.IsNullOrWhiteSpace(row.OrderNo))
+                .Select(row => row.OrderNo.Trim())
+                .Concat(ResiRows
+                    .Where(row => SamePrintFile(row.PdfPath, documentName) && !string.IsNullOrWhiteSpace(row.OrderSn))
+                    .Select(row => row.OrderSn.Trim()))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var normalizedDocument = documentName.Trim().Trim('"');
+            var fileName = "";
+            try { fileName = Path.GetFileName(normalizedDocument); } catch { }
+            foreach (var key in new[] { normalizedDocument, fileName }.Where(x => !string.IsNullOrWhiteSpace(x)))
+            {
+                if (_printingOrderLookup.TryGetValue(key, out var cachedOrders))
+                    orders.AddRange(cachedOrders);
+            }
+
+            var distinct = orders.Distinct(StringComparer.OrdinalIgnoreCase).Take(4).ToList();
+            return distinct.Count == 0 ? "-" : string.Join("\n", distinct);
+        }
+
+        private void RefreshPrintingOrderLookupIfNeeded()
+        {
+            if (DateTime.Now - _printingOrderLookupUpdatedAt < TimeSpan.FromSeconds(10))
+                return;
+
+            _printingOrderLookupUpdatedAt = DateTime.Now;
+            _printingOrderLookup.Clear();
+
+            void AddLookup(string path, string orderSn)
+            {
+                if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(orderSn)) return;
+                var keys = new List<string> { path.Trim().Trim('"') };
+                try { keys.Add(Path.GetFileName(path)); } catch { }
+                foreach (var key in keys.Where(x => !string.IsNullOrWhiteSpace(x)))
+                {
+                    if (!_printingOrderLookup.TryGetValue(key, out var orders))
+                        _printingOrderLookup[key] = orders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    orders.Add(orderSn.Trim());
+                }
+            }
+
+            try
+            {
+                using var con = OpenDb();
+                con.Open();
+                using var cmd = con.CreateCommand();
+                cmd.CommandText = @"
+SELECT order_sn, item_key, model_sku, item_sku
+FROM order_process
+WHERE IFNULL(UPPER(TRIM(status)), '') <> 'CANCELLED'
+ORDER BY create_time DESC
+LIMIT 3000;";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    var orderSn = reader.IsDBNull(0) ? "" : reader.GetString(0);
+                    var itemKey = reader.IsDBNull(1) ? "" : reader.GetString(1);
+                    var modelSku = reader.IsDBNull(2) ? "" : reader.GetString(2);
+                    var itemSku = reader.IsDBNull(3) ? "" : reader.GetString(3);
+                    var map = ResolveDataMapForOrder(itemKey, modelSku, itemSku);
+                    if (map != null)
+                        AddLookup(map.FilePath, orderSn);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogPrint("PRINT QUEUE ORDER LOOKUP: " + ex.Message);
+            }
+        }
+
+        private async Task RefreshPrintingQueueAsync()
+        {
+            if (_printingQueuePollBusy)
+                return;
+
+            _printingQueuePollBusy = true;
+            try
+            {
+                var snapshots = await Task.Run(() =>
+                {
+                    var result = new List<SpoolerJobSnapshot>();
+                    using var server = new LocalPrintServer();
+                    foreach (var queue in server.GetPrintQueues())
+                    {
+                        try
+                        {
+                            queue.Refresh();
+                            foreach (var job in queue.GetPrintJobInfoCollection())
+                            {
+                                try
+                                {
+                                    job.Refresh();
+                                    var key = $"{queue.FullName}|{job.JobIdentifier}";
+                                    var total = Math.Max(0, job.NumberOfPages);
+                                    var printed = Math.Max(0, job.NumberOfPagesPrinted);
+                                    var pages = total > 0 ? $"{printed}/{total}" : "-";
+                                    var submittedUtc = job.TimeJobSubmitted.Kind == DateTimeKind.Utc
+                                        ? job.TimeJobSubmitted
+                                        : DateTime.SpecifyKind(job.TimeJobSubmitted, DateTimeKind.Utc);
+                                    result.Add(new SpoolerJobSnapshot(
+                                        key,
+                                        job.JobIdentifier,
+                                        queue.Name,
+                                        string.IsNullOrWhiteSpace(job.Name) ? "(tanpa nama)" : job.Name,
+                                        submittedUtc.ToLocalTime(),
+                                        GetSpoolerStatus(job.JobStatus),
+                                        pages));
+                                }
+                                catch { }
+                            }
+                        }
+                        catch { }
+                    }
+                    return result;
+                });
+
+                var now = DateTime.Now;
+                var activeKeys = snapshots.Select(x => x.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                foreach (var snapshot in snapshots.OrderBy(x => x.SubmittedAt))
+                {
+                    _printingQueueLastSeen[snapshot.Key] = now;
+                    var item = PrintingQueueItems.FirstOrDefault(x =>
+                        string.Equals(x.Key, snapshot.Key, StringComparison.OrdinalIgnoreCase));
+                    if (item == null)
+                    {
+                        PrintingQueueItems.Insert(0, new PrintingQueueItem
+                        {
+                            Key = snapshot.Key,
+                            JobId = snapshot.JobId,
+                            PrinterName = snapshot.PrinterName,
+                            DocumentName = snapshot.DocumentName,
+                            SubmittedAt = snapshot.SubmittedAt,
+                            Status = snapshot.Status,
+                            PageProgress = snapshot.PageProgress
+                        });
+                    }
+                    else
+                    {
+                        item.Status = snapshot.Status;
+                        item.PageProgress = snapshot.PageProgress;
+                    }
+                }
+
+                foreach (var item in PrintingQueueItems.Where(x => !x.IsCompleted).ToList())
+                {
+                    if (!activeKeys.Contains(item.Key) &&
+                        _printingQueueLastSeen.TryGetValue(item.Key, out var lastSeen) &&
+                        now - lastSeen > TimeSpan.FromSeconds(1))
+                    {
+                        item.Status = "Selesai";
+                    }
+                }
+
+                while (PrintingQueueItems.Count > 200)
+                    PrintingQueueItems.RemoveAt(PrintingQueueItems.Count - 1);
+
+                if (TxtPrintingQueueStatus != null)
+                    TxtPrintingQueueStatus.Text = PrintingQueueItems.Count == 0
+                        ? "Tidak ada job di Windows print queue"
+                        : $"{PrintingQueueItems.Count} job terdeteksi • diperbarui {DateTime.Now:HH:mm:ss}";
+            }
+            catch (Exception ex)
+            {
+                LogPrint("PRINT QUEUE MONITOR: " + ex.Message);
+                if (TxtPrintingQueueStatus != null)
+                    TxtPrintingQueueStatus.Text = "Gagal membaca Windows print queue: " + ex.Message;
+            }
+            finally
+            {
+                _printingQueuePollBusy = false;
+            }
+        }
+
+        private async void PrintingQueueRefresh_Click(object sender, RoutedEventArgs e) =>
+            await RefreshPrintingQueueAsync();
+
+        private void PrintingQueueClearCompleted_Click(object sender, RoutedEventArgs e)
+        {
+            foreach (var item in PrintingQueueItems.Where(x => x.IsCompleted).ToList())
+            {
+                PrintingQueueItems.Remove(item);
+                _printingQueueLastSeen.Remove(item.Key);
+            }
+        }
+
+        private enum PrintingJobCommand { Pause, Resume, Cancel }
+
+        private async Task ExecutePrintingJobCommandAsync(PrintingQueueItem item, PrintingJobCommand command)
+        {
+            try
+            {
+                await Task.Run(() =>
+                {
+                    using var server = new LocalPrintServer();
+                    using var queue = server.GetPrintQueue(item.PrinterName);
+                    using var job = queue.GetJob(item.JobId);
+
+                    switch (command)
+                    {
+                        case PrintingJobCommand.Pause:
+                            job.Pause();
+                            break;
+                        case PrintingJobCommand.Resume:
+                            job.Resume();
+                            break;
+                        case PrintingJobCommand.Cancel:
+                            job.Cancel();
+                            break;
+                    }
+                });
+
+                await Task.Delay(250);
+                await RefreshPrintingQueueAsync();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this,
+                    $"Tidak bisa {command.ToString().ToLowerInvariant()} job {item.JobId}:\n{ex.Message}",
+                    "Printing Queue", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private async void PrintingJobPause_Click(object sender, RoutedEventArgs e)
+        {
+            if ((sender as FrameworkElement)?.DataContext is PrintingQueueItem item)
+                await ExecutePrintingJobCommandAsync(item, PrintingJobCommand.Pause);
+        }
+
+        private async void PrintingJobResume_Click(object sender, RoutedEventArgs e)
+        {
+            if ((sender as FrameworkElement)?.DataContext is PrintingQueueItem item)
+                await ExecutePrintingJobCommandAsync(item, PrintingJobCommand.Resume);
+        }
+
+        private async void PrintingJobCancel_Click(object sender, RoutedEventArgs e)
+        {
+            if ((sender as FrameworkElement)?.DataContext is not PrintingQueueItem item)
+                return;
+
+            var answer = MessageBox.Show(this,
+                $"Batalkan job {item.JobId}?\n\n{item.DocumentName}\n{item.PrinterName}",
+                "Cancel Print Job", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+            if (answer == MessageBoxResult.Yes)
+                await ExecutePrintingJobCommandAsync(item, PrintingJobCommand.Cancel);
+        }
 
         private async Task MonitorPrintJobAsync(JobRow r, string queuePrinterName, CancellationToken ct)
         {
@@ -8117,6 +9543,123 @@ public MainWindow()
         // Printers list
         // =====================
 
+        private string PrinterDisplayConfigPath => Path.Combine(ConfigDir, "printers.json");
+
+        private sealed class PrinterDisplayConfig
+        {
+            public List<string>? VisiblePrinters { get; set; }
+        }
+
+        private List<string> GetAllInstalledPrinterNames()
+        {
+            var result = new List<string>();
+            void Add(string? name)
+            {
+                name = name?.Trim();
+                if (!string.IsNullOrWhiteSpace(name) &&
+                    !result.Any(x => string.Equals(x, name, StringComparison.OrdinalIgnoreCase)))
+                    result.Add(name);
+            }
+
+            try
+            {
+                foreach (string name in System.Drawing.Printing.PrinterSettings.InstalledPrinters)
+                    Add(name);
+                using var server = new LocalPrintServer();
+                foreach (var queue in server.GetPrintQueues())
+                    Add(queue.Name);
+            }
+            catch
+            {
+                foreach (string name in System.Drawing.Printing.PrinterSettings.InstalledPrinters)
+                    Add(name);
+            }
+
+            return result.OrderBy(x => x, StringComparer.CurrentCultureIgnoreCase).ToList();
+        }
+
+        private HashSet<string>? LoadVisiblePrinterNames()
+        {
+            try
+            {
+                if (!File.Exists(PrinterDisplayConfigPath)) return null;
+                var config = JsonSerializer.Deserialize<PrinterDisplayConfig>(File.ReadAllText(PrinterDisplayConfigPath));
+                return config?.VisiblePrinters == null
+                    ? null
+                    : new HashSet<string>(config.VisiblePrinters, StringComparer.OrdinalIgnoreCase);
+            }
+            catch { return null; }
+        }
+
+        private void SaveVisiblePrinterNames(IEnumerable<string> names)
+        {
+            Directory.CreateDirectory(ConfigDir);
+            var config = new PrinterDisplayConfig { VisiblePrinters = names.OrderBy(x => x).ToList() };
+            File.WriteAllText(PrinterDisplayConfigPath,
+                JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }));
+        }
+
+        private void ConfigurePrinters_Click(object sender, RoutedEventArgs e)
+        {
+            var all = GetAllInstalledPrinterNames();
+            if (all.Count == 0)
+            {
+                MessageBox.Show(this, "Tidak ada printer yang terdeteksi.", "Atur printer",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            var visible = LoadVisiblePrinterNames();
+            var checks = all.Select(name => new CheckBox
+            {
+                Content = name,
+                IsChecked = visible == null || visible.Contains(name),
+                Margin = new Thickness(4, 3, 4, 3)
+            }).ToList();
+            var list = new StackPanel();
+            foreach (var check in checks) list.Children.Add(check);
+
+            var selectAll = new Button { Content = "Pilih semua", Padding = new Thickness(10, 4, 10, 4), Margin = new Thickness(0, 0, 6, 0) };
+            var selectNone = new Button { Content = "Hapus semua", Padding = new Thickness(10, 4, 10, 4), Margin = new Thickness(0, 0, 6, 0) };
+            var save = new Button { Content = "Simpan", IsDefault = true, Padding = new Thickness(16, 4, 16, 4) };
+            var cancel = new Button { Content = "Batal", IsCancel = true, Padding = new Thickness(16, 4, 16, 4), Margin = new Thickness(0, 0, 6, 0) };
+            selectAll.Click += (_, _) => checks.ForEach(x => x.IsChecked = true);
+            selectNone.Click += (_, _) => checks.ForEach(x => x.IsChecked = false);
+
+            var buttons = new DockPanel { Margin = new Thickness(10) };
+            var left = new StackPanel { Orientation = Orientation.Horizontal };
+            left.Children.Add(selectAll); left.Children.Add(selectNone);
+            DockPanel.SetDock(left, Dock.Left); buttons.Children.Add(left);
+            var right = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = System.Windows.HorizontalAlignment.Right };
+            right.Children.Add(cancel); right.Children.Add(save);
+            DockPanel.SetDock(right, Dock.Right); buttons.Children.Add(right);
+
+            var root = new DockPanel();
+            DockPanel.SetDock(buttons, Dock.Bottom); root.Children.Add(buttons);
+            root.Children.Add(new ScrollViewer { Content = list, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Margin = new Thickness(10, 10, 10, 0) });
+            var dialog = new Window
+            {
+                Title = "Printer yang ditampilkan", Owner = this,
+                Width = 520, Height = 520, MinWidth = 380, MinHeight = 320,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner, Content = root
+            };
+            save.Click += (_, _) =>
+            {
+                var selected = checks.Where(x => x.IsChecked == true).Select(x => (string)x.Content).ToList();
+                if (selected.Count == 0)
+                {
+                    MessageBox.Show(dialog, "Pilih minimal satu printer.", "Atur printer",
+                        MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+                SaveVisiblePrinterNames(selected);
+                dialog.DialogResult = true;
+            };
+
+            if (dialog.ShowDialog() == true)
+                RefreshPrinters();
+        }
+
         /// <summary>Set pilihan printer label: pertahankan <paramref name="previousSelection"/> jika masih ada, lalu default Epson L3210 (nama mengandung <see cref="ResiDefaultPrinterNameContains"/>), lalu printer pertama.</summary>
         private void SelectResiPrinterDefaultOrRestore(string? previousSelection)
         {
@@ -8175,6 +9718,13 @@ public MainWindow()
                     if (!string.IsNullOrWhiteSpace(n) && !Printers.Contains(n))
                         Printers.Add(n);
                 }
+            }
+
+            var visible = LoadVisiblePrinterNames();
+            if (visible != null)
+            {
+                foreach (var hidden in Printers.Where(name => !visible.Contains(name)).ToList())
+                    Printers.Remove(hidden);
             }
 
             SelectResiPrinterDefaultOrRestore(previous);
@@ -8268,7 +9818,7 @@ public MainWindow()
     var t = ds.Tables[0];
 
         // ✅ Wajib (No. Referensi SKU) + ✅ Optional (SKU Induk / Variasi)
-    string colNoRef = FindCol(t, "Variasi", "variasi", "No.Referensi SKU", "Nomor Referensi SKU", "No Referensi SKU", "Nomor Referensi", "Product Code", "ProductCode", "SKU ID", "SKUID", "SKU");
+    string colNoRef = FindCol(t, "SKU ID", "SKUID", "No.Referensi SKU", "Nomor Referensi SKU", "No Referensi SKU", "Nomor Referensi", "Product Code", "ProductCode", "SKU");
     string? colSkuInduk = FindColOptional(t, "SKU Induk", "SKUInduk", "Induk SKU", "Parent SKU", "SKU Parent", "SKU Induk (Parent)");
     string? colVar = FindColOptional(t, "Nama Variasi", "Variasi", "Variant");
 
@@ -8332,6 +9882,21 @@ if (!string.IsNullOrWhiteSpace(map.SKUInduk) && !_dataMap.ContainsKey(KeySkuIndu
 if (!string.IsNullOrWhiteSpace(map.NoRef) && !_dataMap.ContainsKey(KeyRefOnly(map.NoRef)))
     _dataMap[KeyRefOnly(map.NoRef)] = map;
 
+// TikTok order detail exposes seller_sku as a single SKU value. Store direct
+// normalized aliases so DB item_key values like "wmanxxkpoa5" can map too.
+if (!string.IsNullOrWhiteSpace(map.SKUInduk) && !_dataMap.ContainsKey(NormKey(map.SKUInduk)))
+    _dataMap[NormKey(map.SKUInduk)] = map;
+
+if (!string.IsNullOrWhiteSpace(map.NoRef) && !_dataMap.ContainsKey(NormKey(map.NoRef)))
+    _dataMap[NormKey(map.NoRef)] = map;
+
+if (!string.IsNullOrWhiteSpace(map.SKUInduk) && !string.IsNullOrWhiteSpace(map.NoRef))
+{
+    var directSellerSku = NormKey(map.SKUInduk + map.NoRef);
+    if (!string.IsNullOrWhiteSpace(directSellerSku) && !_dataMap.ContainsKey(directSellerSku))
+        _dataMap[directSellerSku] = map;
+}
+
 if (!string.IsNullOrWhiteSpace(map.NoRef) || !string.IsNullOrWhiteSpace(map.Variasi))
     _dataMap[KeyRefVar(map.NoRef, map.Variasi)] = map;
 
@@ -8343,6 +9908,7 @@ RebuildSearchIndex();
         {
             DeleteTempMergedPdfsForAllRowsInQueue();
             Rows.Clear();
+            _productPrinterBeforeOverride.Clear();
 
             using var con = OpenDb();
             con.Open();
@@ -8365,8 +9931,10 @@ LIMIT $top;
                 var modelName = rd.GetString(3);
                 var qty = rd.GetInt32(4);
                 var createT = rd.GetInt64(6);
+                var modelSku = rd.IsDBNull(7) ? "" : rd.GetString(7);
+                var itemSku = rd.IsDBNull(8) ? "" : rd.GetString(8);
 
-                _dataMap.TryGetValue(itemKey, out var map);
+                var map = ResolveDataMapForOrder(itemKey, modelSku, itemSku);
 
                 JobRow row;
                 if (map != null)
@@ -8415,6 +9983,8 @@ LIMIT $top;
 
                 Rows.Add(row);
             }
+
+            ApplyPrinterOverrideToProductRows();
         }
 
         private void ImportOrdersAndCreateRows(string orderXlsxPath)
@@ -8444,7 +10014,7 @@ LIMIT $top;
 
             var t = ds.Tables[0];
 
-            string colNoRef = FindCol(t, "No.Referensi SKU", "Nomor Referensi SKU", "No Referensi SKU", "Nomor Referensi", "Product Code", "ProductCode", "SKU ID", "SKUID", "SKU");
+            string colNoRef = FindCol(t, "SKU ID", "SKUID", "No.Referensi SKU", "Nomor Referensi SKU", "No Referensi SKU", "Nomor Referensi", "Product Code", "ProductCode", "SKU");
             string? colSkuInduk = FindColOptional(t, "SKU Induk", "SKUInduk", "Induk SKU", "Parent SKU", "SKU Parent", "SKU Induk (Parent)");
             string? colVar = FindColOptional(t, "Nama Variasi", "Variasi", "Variant");
 string colQty = FindCol(t, "Jumlah", "Qty", "Quantity");
@@ -8560,6 +10130,7 @@ if (map != null)
                     Rows.Add(r);
                 }
             }
+            ApplyPrinterOverrideToProductRows();
 }
 
         private static DuplexMode ParseDuplex(string? v)
@@ -9380,6 +10951,9 @@ public string VariationName
 
         /// <summary>True: cetak lewat Pdfium+GDI dengan gambar mulai kiri-atas area margin (label Shopee).</summary>
         public bool PrintFromTopLeft { get; set; }
+
+        /// <summary>True untuk label pengiriman yang harus memakai tray atas printer yang didukung.</summary>
+        public bool ForceUpperTray { get; set; }
 
         public bool Selected { get => _selected; set { _selected = value; On(); } }
         public string Status { get => _status; set { _status = value; On(); } }

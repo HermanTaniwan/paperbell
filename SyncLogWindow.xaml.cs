@@ -17,6 +17,12 @@ namespace PaperbellAppDotNet
             LogBox.ScrollToEnd();
         }
 
+        public void SetSyncName(string windowTitle, string progressTitle)
+        {
+            Title = windowTitle;
+            TxtTitle.Text = progressTitle;
+        }
+
         public void SetProgress(double percent, string? label = null)
         {
             if (percent < 0) percent = 0;
@@ -48,6 +54,18 @@ namespace PaperbellAppDotNet
                 BtnClose.Content = "Cancelling...";
                 return;
             }
+            Close();
+        }
+
+        private void Window_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+        {
+            if (e.Key != System.Windows.Input.Key.Escape)
+                return;
+
+            e.Handled = true;
+            if (_running)
+                CancelRequested?.Invoke();
+
             Close();
         }
     }

@@ -214,9 +214,9 @@ namespace PaperbellAppDotNet
             }
 
             var map = picked.Map;
-            if (string.IsNullOrWhiteSpace(map.NoRef) || string.IsNullOrWhiteSpace(map.SKUInduk))
+            if (string.IsNullOrWhiteSpace(map.NoRef))
             {
-                MessageBox.Show(this, "Baris Data Map ini tidak punya NoRef + SKUInduk — tidak bisa dipakai sebagai item_key inventory.",
+                MessageBox.Show(this, "Baris Data Map ini tidak punya SKU ID — tidak bisa dipakai sebagai item_key inventory.",
                     "Inventory", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }

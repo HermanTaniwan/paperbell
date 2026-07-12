@@ -228,9 +228,9 @@
 
     <Grid>
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="3*" />
             <ColumnDefinition Width="6" />
-            <ColumnDefinition Width="460" />
+            <ColumnDefinition Width="2*" />
         </Grid.ColumnDefinitions>
 
         
@@ -242,14 +242,18 @@
                 <Button Content="Random pages…" Click="RandomPages_Click" Margin="0,0,6,4"
                         ToolTip="N = jumlah PDF berbeda (acak). Planner: 1 hal./PDF → N halaman total. Loose Leaf: tiap PDF spread ganjil+genap berurutan (mis. 3–4) → 2×N halaman. A5/B5; Planner → L3210, Loose Leaf → Brother."/>
                 <Button Content="Load Data Map (XLSX)…" x:Name="BtnLoadMap" Click="LoadMap_Click" Margin="0,0,6,4"/>
-                <Button Content="Import Orders (XLSX)…" Click="ImportOrders_Click" Margin="0,0,6,4"/>
+                <Button Content="Sync Data Mapping" x:Name="BtnSyncDataMapping"
+                        Click="SyncDataMapping_Click" Margin="0,0,6,4"
+                        ToolTip="Unduh mapping terbaru dari Google Sheets."/>
                 <Button x:Name="BtnConnectShopee" Content="Connect Shopee" Click="Connect_Click" Margin="0,0,6,4"/>
                 <Button Content="Shopee Sync…" Click="ShopeeSync_Click" Margin="0,0,6,4"/>
+                <Button Content="TikTok Sync…" Click="TikTokSync_Click" Margin="0,0,6,4"/>
                 <Button Content="Inventory…" Click="OpenInventory_Click" Margin="0,0,6,4"
                         ToolTip="Kelola stok produk yang sudah dicetak di muka"/>
-                <Button Content="Refresh Printers" Click="RefreshPrinters_Click" Margin="0,0,6,4"/>
-                <Button Content="Print all" Click="PrintSelected_Click" Margin="0,0,6,4"
-                        ToolTip="Cetak semua baris di daftar saat ini (tab All / Not Printed / Printed)."/>
+                <Button Content="Atur Printer…" Click="ConfigurePrinters_Click" Margin="0,0,6,4"
+                        ToolTip="Pilih printer yang ditampilkan di dropdown."/>
+                <Button x:Name="BtnCuciDarah" Content="Cuci Darah" Click="CuciDarah_Click" Margin="0,0,6,4"
+                        ToolTip="Cetak PINK.pdf ukuran A5 melalui tray atas WF-C5790."/>
                 <Button Content="Printing log…" Click="OpenPrintLog_Click" Margin="0,0,6,4"/>
             </WrapPanel>
 
@@ -288,8 +292,7 @@
                                Text="Override: (auto)"/>
                 </StackPanel>
                 <StackPanel DockPanel.Dock="Top" Margin="0,0,0,6">
-                    <TextBlock x:Name="TxtOrderSummary" Text="Siap bungkus: — · Belum selesai: —"
-                              Foreground="#2E7D32" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                    <TextBlock x:Name="TxtOrderSummary" Visibility="Collapsed"/>
                     <StackPanel Orientation="Horizontal">
                         <TextBlock Text="Order Shopee:" VerticalAlignment="Center" Margin="0,0,8,0" Foreground="#555"/>
                         <Button x:Name="BtnShopeePrev" Content="Prev" Width="70" Margin="0,0,6,0" Click="BtnShopeePrev_Click"/>
@@ -304,8 +307,6 @@
                     <TabItem Header="All" />
                     <TabItem Header="Not Printed" />
                     <TabItem Header="Printed" />
-                    <TabItem Header="Siap bungkus" />
-                    <TabItem Header="Sudah dibungkus" />
                     <TabItem Header="Cancel" />
                 </TabControl>
 
@@ -610,10 +611,17 @@ CanUserAddRows="False"
                                                Style="{StaticResource SixHoleBadgeTextStyle}"/>
 
                                     <!-- FILE (FULL PATH) -->
-                                    <TextBlock Text="{Binding File}"
-                                               FontWeight="SemiBold"
-                                               TextWrapping="Wrap"
-                                               Margin="0,0,0,6"/>
+                                    <Button Content="{Binding File}" Click="OpenPdfFile_Click"
+                                            HorizontalContentAlignment="Left" HorizontalAlignment="Stretch"
+                                            Padding="0" Margin="0,0,0,6" Background="Transparent"
+                                            BorderThickness="0" Foreground="#1565C0" Cursor="Hand"
+                                            FontWeight="SemiBold" ToolTip="Buka PDF di Chrome">
+                                        <Button.ContentTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding}" TextWrapping="Wrap" TextTrimming="None"/>
+                                            </DataTemplate>
+                                        </Button.ContentTemplate>
+                                    </Button>
 
                                     <!-- PRINTER -->
                                     <StackPanel Margin="0,0,0,6">
@@ -760,6 +768,8 @@ CanUserAddRows="False"
                             <ComboBox x:Name="CmbResiPrinter" Width="300" VerticalAlignment="Center"
                                       ItemsSource="{Binding Printers}"/>
                             <Button Content="Refresh daftar" Click="BtnResiRefresh_Click" Margin="12,0,6,0" Padding="10,4"/>
+                            <Button Content="Atur printer…" Click="ConfigurePrinters_Click" Margin="0,0,6,0" Padding="10,4"
+                                    ToolTip="Pilih printer yang ditampilkan di dropdown."/>
                             <Button Content="Pilih semua (halaman)" Click="BtnResiSelectAllPage_Click" Margin="0,0,6,0" Padding="10,4"
                                     ToolTip="Sorot semua baris di halaman ini (sama seperti select all di Excel)."/>
                             <Button Content="Hapus pilihan" Click="BtnResiClearChecks_Click" Margin="0,0,6,0" Padding="10,4"
@@ -942,7 +952,7 @@ CanUserAddRows="False"
         <Border Grid.Column="1" Background="#ddd"/>
 
         <!-- RIGHT -->
-        <DockPanel Grid.Column="2" Margin="12">
+        <DockPanel x:Name="PdfPreviewPanel" Grid.Column="2" Margin="12" Visibility="Collapsed">
             <TextBlock x:Name="TxtPdfPreviewTitle" Text="PDF Preview" FontWeight="Bold" DockPanel.Dock="Top" Margin="0,0,0,4"/>
             <TextBlock x:Name="TxtPreviewHint" DockPanel.Dock="Top" TextWrapping="Wrap" Margin="0,0,0,8"
                        Foreground="#666" FontSize="12" Visibility="Collapsed"/>
@@ -961,7 +971,8 @@ CanUserAddRows="False"
                             <DataTemplate>
                                 <Border BorderBrush="#ccc" BorderThickness="1" Margin="6" Padding="6" Background="White">
                                     <StackPanel>
-                                        <Image Source="{Binding Image}" Width="180" Stretch="Uniform"
+                                        <Image Source="{Binding Image}" Width="400" Stretch="Uniform"
+                                               HorizontalAlignment="Center"
                                        Cursor="Hand" MouseLeftButtonUp="Thumb_Click"/>
                                         <TextBlock Text="{Binding Caption}" Margin="0,6,0,0" HorizontalAlignment="Center"/>
                                     </StackPanel>
@@ -984,6 +995,124 @@ CanUserAddRows="False"
                        VerticalAlignment="Center"/>
                 </Border>
             </Grid>
+        </DockPanel>
+
+        <DockPanel x:Name="PrintingQueuePanel" Grid.Column="2" Margin="12" LastChildFill="True">
+            <TextBlock Text="Printing Queue" FontSize="16" FontWeight="SemiBold"
+                       DockPanel.Dock="Top" Margin="0,0,0,8"/>
+            <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,8">
+                <Button Content="Refresh" Click="PrintingQueueRefresh_Click" Padding="10,4" Margin="0,0,6,0"/>
+                <Button Content="Hapus selesai" Click="PrintingQueueClearCompleted_Click" Padding="10,4"/>
+            </StackPanel>
+            <TextBlock x:Name="TxtPrintingQueueStatus" DockPanel.Dock="Top"
+                       Text="Membaca Windows print queue..." Foreground="#666"
+                       TextWrapping="Wrap" Margin="0,0,0,8"/>
+            <DataGrid ItemsSource="{Binding PrintingQueueItems}"
+                      AutoGenerateColumns="False" IsReadOnly="True"
+                      CanUserAddRows="False" HeadersVisibility="Column"
+                      GridLinesVisibility="Horizontal">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Jam" Binding="{Binding SubmittedAtText}" Width="62"/>
+                    <DataGridTemplateColumn Header="Dokumen" Width="*">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding DocumentName}" TextWrapping="Wrap"
+                                           VerticalAlignment="Top" Margin="2"/>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                    <DataGridTextColumn Header="Printer" Binding="{Binding PrinterName}" Width="120"/>
+                    <DataGridTemplateColumn Header="Status" Width="85">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding Status}" FontWeight="SemiBold" Opacity="1">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Foreground" Value="#555"/>
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding Status}" Value="Queued">
+                                                    <DataTrigger.EnterActions>
+                                                        <BeginStoryboard x:Name="QueuedFadeStoryboard">
+                                                            <Storyboard RepeatBehavior="Forever" AutoReverse="True">
+                                                                <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                                                                 From="1" To="0.3" Duration="0:0:0.7"/>
+                                                            </Storyboard>
+                                                        </BeginStoryboard>
+                                                    </DataTrigger.EnterActions>
+                                                    <DataTrigger.ExitActions>
+                                                        <StopStoryboard BeginStoryboardName="QueuedFadeStoryboard"/>
+                                                    </DataTrigger.ExitActions>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Status}" Value="Spooling">
+                                                    <DataTrigger.EnterActions>
+                                                        <BeginStoryboard x:Name="SpoolingFadeStoryboard">
+                                                            <Storyboard RepeatBehavior="Forever" AutoReverse="True">
+                                                                <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                                                                 From="1" To="0.3" Duration="0:0:0.7"/>
+                                                            </Storyboard>
+                                                        </BeginStoryboard>
+                                                    </DataTrigger.EnterActions>
+                                                    <DataTrigger.ExitActions>
+                                                        <StopStoryboard BeginStoryboardName="SpoolingFadeStoryboard"/>
+                                                    </DataTrigger.ExitActions>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Status}" Value="Printing">
+                                                    <Setter Property="Foreground" Value="#1565C0"/>
+                                                    <DataTrigger.EnterActions>
+                                                        <BeginStoryboard x:Name="PrintingFadeStoryboard">
+                                                            <Storyboard RepeatBehavior="Forever" AutoReverse="True">
+                                                                <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                                                                 From="1" To="0.3" Duration="0:0:0.7"/>
+                                                            </Storyboard>
+                                                        </BeginStoryboard>
+                                                    </DataTrigger.EnterActions>
+                                                    <DataTrigger.ExitActions>
+                                                        <StopStoryboard BeginStoryboardName="PrintingFadeStoryboard"/>
+                                                    </DataTrigger.ExitActions>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Status}" Value="Paused">
+                                                    <Setter Property="Foreground" Value="#EF6C00"/>
+                                                    <DataTrigger.EnterActions>
+                                                        <BeginStoryboard x:Name="PausedFadeStoryboard">
+                                                            <Storyboard RepeatBehavior="Forever" AutoReverse="True">
+                                                                <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                                                                 From="1" To="0.3" Duration="0:0:0.7"/>
+                                                            </Storyboard>
+                                                        </BeginStoryboard>
+                                                    </DataTrigger.EnterActions>
+                                                    <DataTrigger.ExitActions>
+                                                        <StopStoryboard BeginStoryboardName="PausedFadeStoryboard"/>
+                                                    </DataTrigger.ExitActions>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Status}" Value="Selesai">
+                                                    <Setter Property="Foreground" Value="#2E7D32"/>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Status}" Value="Error">
+                                                    <Setter Property="Foreground" Value="#C62828"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                    <DataGridTemplateColumn Header="Aksi" Width="150">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <WrapPanel Visibility="{Binding IsActive, Converter={StaticResource BoolToVis}}">
+                                    <Button Content="Pause" Click="PrintingJobPause_Click"
+                                            Padding="5,2" Margin="0,0,3,2"/>
+                                    <Button Content="Resume" Click="PrintingJobResume_Click"
+                                            Padding="5,2" Margin="0,0,3,2"/>
+                                    <Button Content="Cancel" Click="PrintingJobCancel_Click"
+                                            Padding="5,2" Margin="0,0,0,2" Foreground="#B71C1C"/>
+                                </WrapPanel>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                </DataGrid.Columns>
+            </DataGrid>
         </DockPanel>
 
         <!-- Unduh label massal: progress -->
